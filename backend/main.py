@@ -8,6 +8,7 @@ FastAPI server handling:
 """
 
 import os
+import asyncio
 import re
 import json
 import math
@@ -133,6 +134,19 @@ deferred_runner_status = {
     "heartbeat_ts": time.time(),
     "pause_requested": False,
     "paused": False,
+}
+
+index_runner_lock = Lock()
+index_runner_status = {
+    "running": False,
+    "current_pdf_id": "",
+    "current_filename": "",
+    "last_error": "",
+    "heartbeat_ts": time.time(),
+    "started_at": 0.0,
+    "finished_pdf_id": "",
+    "finished_filename": "",
+    "status": "idle",
 }
 
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
@@ -1035,6 +1049,37 @@ def cnr_number_from_filename(filename: str) -> str:
     return Path(filename or "").stem.strip()
 
 
+def build_existing_pdf_payload(pdf_id: str, filename_override: str = "") -> Optional[dict]:
+    record = get_pdf_record(pdf_id)
+    pdf_path = stored_pdf_path(pdf_id)
+    if not record or not pdf_path.exists():
+        return None
+    saved_index = get_saved_index(pdf_id)
+    return {
+        "pdf_id": pdf_id,
+        "cnr_number": record.get("cnr_number") or cnr_number_from_filename(filename_override or record.get("filename") or ""),
+        "total_pages": record.get("total_pages", 0),
+        "indexed_pages": record.get("indexed_pages", 0),
+        "indexed_page_start": record.get("selected_start_page", 1),
+        "indexed_page_end": record.get("selected_end_page", 1),
+        "ocr_pages": 0,
+        "vision_ocr_pages": 0,
+        "handwriting_suspected_pages": 0,
+        "digital_pages": 0,
+        "status": record.get("status", "index_ready"),
+        "retrieval_status": record.get("retrieval_status", "pending_deferred_ingestion"),
+        "pending_pages": record.get("pending_pages", 0),
+        "chat_ready": bool(record.get("chat_ready")),
+        "filename": record.get("filename") or filename_override or f"{pdf_id}.pdf",
+        "index": saved_index,
+        "index_entries": len(saved_index),
+        "index_ready": bool(record.get("index_ready")),
+        "index_source": record.get("index_source", "saved"),
+        "skipped_duplicate": True,
+        "message": "This PDF is already saved in the backend. Skipping duplicate upload.",
+    }
+
+
 def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
     pdf_id = pdf_id_from_bytes(pdf_bytes)
     pdf_path = stored_pdf_path(pdf_id)
@@ -1115,6 +1160,146 @@ def health():
 
 
 # ── 1. INGEST PDF ─────────────────────────────────────────────────────────────
+async def build_stage_one_payload_async(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
+    ingest_resp = run_stage_one_ingest(pdf_bytes, filename, start_page=start_page, end_page=end_page)
+    index_resp = await generate_index(IndexRequest(pdf_id=ingest_resp["pdf_id"]))
+    return {
+        **ingest_resp,
+        "index": index_resp.get("index", []),
+        "index_source": index_resp.get("index_source", ingest_resp.get("status")),
+        "status": index_resp.get("status", ingest_resp.get("status")),
+        "retrieval_status": index_resp.get("retrieval_status", ingest_resp.get("retrieval_status")),
+        "pending_pages": index_resp.get("pending_pages", ingest_resp.get("pending_pages")),
+        "chat_ready": index_resp.get("chat_ready", ingest_resp.get("chat_ready")),
+        "indexed_page_start": index_resp.get("indexed_page_start", ingest_resp.get("indexed_page_start")),
+        "indexed_page_end": index_resp.get("indexed_page_end", ingest_resp.get("indexed_page_end")),
+        "indexed_pages": index_resp.get("indexed_pages", ingest_resp.get("indexed_pages")),
+    }
+
+
+def build_stage_one_payload(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
+    return asyncio.run(build_stage_one_payload_async(pdf_bytes, filename, start_page=start_page, end_page=end_page))
+
+
+def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int, end_page: Optional[int], known_pdf_id: str = ""):
+    pdf_id = known_pdf_id or pdf_id_from_bytes(pdf_bytes)
+    index_runner_status.update({
+        "running": True,
+        "current_pdf_id": pdf_id,
+        "current_filename": filename,
+        "last_error": "",
+        "heartbeat_ts": time.time(),
+        "started_at": time.time(),
+        "finished_pdf_id": "",
+        "finished_filename": "",
+        "status": "running",
+    })
+    try:
+        build_stage_one_payload(pdf_bytes, filename, start_page=start_page, end_page=end_page)
+        index_runner_status.update({
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "heartbeat_ts": time.time(),
+            "finished_pdf_id": pdf_id,
+            "finished_filename": filename,
+            "status": "completed",
+        })
+    except Exception as exc:
+        log.exception("Stage 1 background indexing failed for %s", filename)
+        update_pdf_record(pdf_id, status="failed", last_error=str(exc))
+        index_runner_status.update({
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": str(exc),
+            "heartbeat_ts": time.time(),
+            "finished_pdf_id": pdf_id,
+            "finished_filename": filename,
+            "status": "failed",
+        })
+
+
+@app.post("/api/index-runner/upload")
+async def start_background_index_upload(
+    file: UploadFile = File(...),
+    start_page: int = Form(1),
+    end_page: Optional[int] = Form(None),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are accepted")
+
+    with index_runner_lock:
+        if index_runner_status.get("running"):
+            return {
+                "started": False,
+                "runner": dict(index_runner_status),
+                "message": "Background indexing is already running.",
+            }
+
+        pdf_bytes = await file.read()
+        pdf_id = pdf_id_from_bytes(pdf_bytes)
+        existing = build_existing_pdf_payload(pdf_id, file.filename)
+        if existing:
+            return {
+                "started": False,
+                "pdf_id": pdf_id,
+                "filename": existing.get("filename") or file.filename,
+                "runner": dict(index_runner_status),
+                "message": existing.get("message"),
+                "skipped_duplicate": True,
+                "existing": existing,
+            }
+        worker = Thread(
+            target=run_stage_one_index_worker,
+            args=(pdf_bytes, file.filename, start_page, end_page, pdf_id),
+            daemon=True,
+        )
+        worker.start()
+
+    return {
+        "started": True,
+        "pdf_id": pdf_id,
+        "filename": file.filename,
+        "runner": dict(index_runner_status),
+    }
+
+
+@app.post("/api/index-runner/saved/{pdf_id}")
+async def start_background_index_saved(
+    pdf_id: str,
+    start_page: int = Form(1),
+    end_page: Optional[int] = Form(None),
+):
+    record = get_pdf_record(pdf_id)
+    pdf_path = stored_pdf_path(pdf_id)
+    if not record or not pdf_path.exists():
+        raise HTTPException(404, f"PDF {pdf_id} not found")
+
+    with index_runner_lock:
+        if index_runner_status.get("running"):
+            return {
+                "started": False,
+                "runner": dict(index_runner_status),
+                "message": "Background indexing is already running.",
+            }
+
+        pdf_bytes = pdf_path.read_bytes()
+        worker = Thread(
+            target=run_stage_one_index_worker,
+            args=(pdf_bytes, record.get("filename") or f"{pdf_id}.pdf", start_page, end_page, pdf_id),
+            daemon=True,
+        )
+        worker.start()
+
+    return {
+        "started": True,
+        "pdf_id": pdf_id,
+        "filename": record.get("filename") or f"{pdf_id}.pdf",
+        "runner": dict(index_runner_status),
+    }
+
+
 @app.post("/api/ingest")
 async def ingest_pdf(
     file: UploadFile = File(...),
@@ -1149,25 +1334,12 @@ async def reindex_saved_pdf(
         raise HTTPException(404, f"PDF {pdf_id} not found")
 
     pdf_bytes = pdf_path.read_bytes()
-    ingest_resp = run_stage_one_ingest(
+    return await build_stage_one_payload_async(
         pdf_bytes,
         record.get("filename") or f"{pdf_id}.pdf",
         start_page=start_page,
         end_page=end_page,
     )
-    index_resp = await generate_index(IndexRequest(pdf_id=ingest_resp["pdf_id"]))
-    return {
-        **ingest_resp,
-        "index": index_resp.get("index", []),
-        "index_source": index_resp.get("index_source", ingest_resp.get("status")),
-        "status": index_resp.get("status", ingest_resp.get("status")),
-        "retrieval_status": index_resp.get("retrieval_status", ingest_resp.get("retrieval_status")),
-        "pending_pages": index_resp.get("pending_pages", ingest_resp.get("pending_pages")),
-        "chat_ready": index_resp.get("chat_ready", ingest_resp.get("chat_ready")),
-        "indexed_page_start": index_resp.get("indexed_page_start", ingest_resp.get("indexed_page_start")),
-        "indexed_page_end": index_resp.get("indexed_page_end", ingest_resp.get("indexed_page_end")),
-        "indexed_pages": index_resp.get("indexed_pages", ingest_resp.get("indexed_pages")),
-    }
 
 
 # -- 2. QUERY / CHATBOT ────────────────────────────────────────────────────────
@@ -1534,21 +1706,29 @@ async def ingest_batch_pdfs(
     vectorize_now: bool = Form(False),
 ):
     results = []
+    seen_pdf_ids: set[str] = set()
     for file in files:
         if not file.filename.lower().endswith(".pdf"):
             results.append({"filename": file.filename, "status": "skipped", "reason": "Only PDF files are accepted"})
             continue
         pdf_bytes = await file.read()
-        ingest_resp = run_stage_one_ingest(pdf_bytes, file.filename, start_page=start_page, end_page=end_page)
-        index_resp = await generate_index(IndexRequest(pdf_id=ingest_resp["pdf_id"]))
-        payload = {
-            **ingest_resp,
-            "index_entries": len(index_resp.get("index", [])),
-            "status": index_resp.get("status", ingest_resp.get("status")),
-            "retrieval_status": index_resp.get("retrieval_status", ingest_resp.get("retrieval_status")),
-            "pending_pages": index_resp.get("pending_pages", ingest_resp.get("pending_pages")),
-            "chat_ready": index_resp.get("chat_ready", ingest_resp.get("chat_ready")),
-        }
+        pdf_id = pdf_id_from_bytes(pdf_bytes)
+        if pdf_id in seen_pdf_ids:
+            results.append({
+                "pdf_id": pdf_id,
+                "filename": file.filename,
+                "status": "skipped",
+                "reason": "Duplicate PDF in the same batch. Skipping.",
+                "skipped_duplicate": True,
+            })
+            continue
+        seen_pdf_ids.add(pdf_id)
+        existing = build_existing_pdf_payload(pdf_id, file.filename)
+        if existing:
+            results.append(existing)
+            continue
+        payload = await build_stage_one_payload_async(pdf_bytes, file.filename, start_page=start_page, end_page=end_page)
+        payload["index_entries"] = len(payload.get("index", []))
         if vectorize_now and payload.get("pending_pages", 0) > 0:
             deferred_resp = await process_pending_pdf(payload["pdf_id"])
             payload.update({
@@ -1586,6 +1766,7 @@ async def get_queues():
     return {
         **build_queue_snapshot(),
         "runner": dict(deferred_runner_status),
+        "index_runner": dict(index_runner_status),
     }
 
 

@@ -625,7 +625,7 @@ export default function App() {
   const [chatReady, setChatReady] = useState(false);
   const [pdfSearch, setPdfSearch] = useState("");
   const [savedPdfs, setSavedPdfs] = useState([]);
-  const [queueSnapshot, setQueueSnapshot] = useState({ index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" } });
+  const [queueSnapshot, setQueueSnapshot] = useState({ index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" }, index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" } });
   const [selectedSavedPdfId, setSelectedSavedPdfId] = useState("");
 
   const [tab, setTab] = useState("index");
@@ -641,6 +641,8 @@ export default function App() {
   const [showAddPanel, setShowAddPanel] = useState(true);
   const [editingIdx, setEditingIdx] = useState(null);
   const [confirmIdx, setConfirmIdx] = useState(null);
+  const [confirmDeletePdf, setConfirmDeletePdf] = useState(null);
+  const handledIndexRunnerRef = useRef("");
 
   const rebuildCoverage = useCallback((items, total) => {
     const cmap = {};
@@ -703,7 +705,7 @@ export default function App() {
   const fetchQueues = useCallback(async () => {
     try {
       const resp = await apiFetch("/api/queues");
-      setQueueSnapshot(resp || { index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" } });
+      setQueueSnapshot(resp || { index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" }, index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" } });
     } catch (err) {
       console.error(err);
     }
@@ -761,9 +763,39 @@ export default function App() {
     const timer = setInterval(() => {
       fetchSavedPdfs(pdfSearch);
       fetchQueues();
-    }, 10000);
+    }, 3000);
     return () => clearInterval(timer);
   }, [fetchSavedPdfs, fetchQueues, pdfSearch]);
+
+  useEffect(() => {
+    const indexRunner = queueSnapshot.index_runner || {};
+    const finishedPdfId = indexRunner.finished_pdf_id || "";
+    if (!finishedPdfId || indexRunner.running || handledIndexRunnerRef.current === finishedPdfId) return;
+    handledIndexRunnerRef.current = finishedPdfId;
+
+    if (pdfId && finishedPdfId === pdfId) {
+      apiFetch(`/api/pdfs/${finishedPdfId}`)
+        .then((details) => {
+          const pdf = details.pdf || {};
+          const normalized = normalizeSections(details.index || [], caseInfo?.batchNo || "");
+          setSections(normalized);
+          rebuildCoverage(normalized, totalPages || pdf.total_pages || 0);
+          setWorkflowStatus(pdf.status || "");
+          setRetrievalStatus(pdf.retrieval_status || "");
+          setPendingPages(pdf.pending_pages || 0);
+          setChatReady(Boolean(pdf.chat_ready));
+          setIndexedRange({
+            start: pdf.selected_start_page || 1,
+            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            count: pdf.indexed_pages || 0,
+          });
+        })
+        .catch((err) => setError(`Error: ${err.message}`));
+    }
+
+    fetchSavedPdfs(pdfSearch);
+    fetchQueues();
+  }, [queueSnapshot.index_runner, pdfId, caseInfo?.batchNo, rebuildCoverage, totalPages, fetchSavedPdfs, fetchQueues, pdfSearch]);
 
   const handleBatchUpload = async (e) => {
     const files = Array.from(e.target.files || []);
@@ -866,62 +898,45 @@ export default function App() {
       setLoadingStep("Checking backend connection...");
       await apiFetch("/health");
 
-      let finalResp;
+      let resp;
       if (isRealFile(pdfFile)) {
-        setLoadingStep(`Step 1/2 - Fast scanning pages ${start} to ${end}, indexing, and saving to backend...`);
+        setLoadingStep(`Starting background indexing for pages ${start} to ${end}...`);
         const formData = new FormData();
         formData.append("file", pdfFile);
         formData.append("start_page", String(start));
         formData.append("end_page", String(end));
-        const ingestResp = await apiUpload("/api/ingest", formData);
-        setPdfId(ingestResp.pdf_id);
-        setWorkflowStatus(ingestResp.status || "");
-        setRetrievalStatus(ingestResp.retrieval_status || "");
-        setPendingPages(ingestResp.pending_pages || 0);
-        setChatReady(Boolean(ingestResp.chat_ready));
-        setIndexedRange({
-          start: ingestResp.indexed_page_start,
-          end: ingestResp.indexed_page_end,
-          count: ingestResp.indexed_pages,
-        });
-
-        const ocrNote = ingestResp.ocr_pages > 0
-          ? ` (${ingestResp.ocr_pages} OCR, ${ingestResp.digital_pages} digital)`
-          : "";
-        setLoadingStep(`Step 2/2 - Building TOC-first index${ocrNote}...`);
-
-        const indexResp = await apiFetch("/api/generate-index", {
-          method: "POST",
-          body: JSON.stringify({ pdf_id: ingestResp.pdf_id }),
-        });
-        finalResp = {
-          ...ingestResp,
-          ...indexResp,
-        };
+        resp = await apiUpload("/api/index-runner/upload", formData);
+        if (!resp.started) {
+          if (resp.skipped_duplicate && resp.existing?.pdf_id) {
+            setPdfId(resp.existing.pdf_id);
+            await loadSavedPdf(resp.existing.pdf_id);
+            await fetchSavedPdfs(pdfSearch);
+            await fetchQueues();
+            return;
+          }
+          throw new Error(resp.message || "Background indexing is already running.");
+        }
+        setPdfId(resp.pdf_id);
+        handledIndexRunnerRef.current = "";
       } else if (pdfId) {
-        setLoadingStep(`Re-indexing saved PDF from backend for pages ${start} to ${end}...`);
+        setLoadingStep(`Starting background re-indexing for pages ${start} to ${end}...`);
         const formData = new FormData();
         formData.append("start_page", String(start));
         formData.append("end_page", String(end));
-        finalResp = await apiUpload(`/api/pdfs/${pdfId}/reindex-saved`, formData);
+        resp = await apiUpload(`/api/index-runner/saved/${pdfId}`, formData);
+        if (!resp.started) {
+          throw new Error(resp.message || "Background indexing is already running.");
+        }
+        handledIndexRunnerRef.current = "";
       } else {
         throw new Error("No upload source found for this PDF.");
       }
 
-      const normalized = normalizeSections(finalResp.index || [], caseInfo?.batchNo || "");
-      setSections(normalized);
-      rebuildCoverage(normalized, totalPages);
-      setIndexedRange({
-        start: finalResp.indexed_page_start,
-        end: finalResp.indexed_page_end,
-        count: finalResp.indexed_pages,
-      });
-      setWorkflowStatus(finalResp.status || "");
-      setRetrievalStatus(finalResp.retrieval_status || "");
-      setPendingPages(finalResp.pending_pages ?? 0);
-      setChatReady(Boolean(finalResp.chat_ready));
+      setWorkflowStatus("indexing_running");
+      setChatReady(false);
       setBatchFilter((value) => value || caseInfo?.batchNo || "");
-      fetchSavedPdfs(pdfSearch);
+      await fetchSavedPdfs(pdfSearch);
+      await fetchQueues();
     } catch (err) {
       console.error(err);
       setError("Error: " + err.message);
@@ -1017,6 +1032,53 @@ export default function App() {
     }
   };
 
+  const deleteSavedPdf = async (item) => {
+    if (!item?.pdf_id) return;
+    const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
+    const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
+    if (isDeferredBusy || isIndexBusy) {
+      setError("Error: This PDF is currently being processed. Stop or wait for the running job before deleting it.");
+      return;
+    }
+
+    setError("");
+    setLoading(true);
+    setLoadingStep(`Deleting ${item.filename || item.pdf_id} from backend...`);
+    try {
+      await apiFetch(`/api/pdfs/${item.pdf_id}`, { method: "DELETE" });
+      if (selectedSavedPdfId === item.pdf_id || pdfId === item.pdf_id) {
+        if (pdfFile?.objectUrl) {
+          try {
+            URL.revokeObjectURL(pdfFile.objectUrl);
+          } catch (_) {}
+        }
+        setPdfDoc(null);
+        setPdfFile(null);
+        setPdfId(null);
+        setTotalPages(0);
+        setCurrentPage(1);
+        setSections([]);
+        setCoverageMap({});
+        setIndexedRange(null);
+        setActiveIdx(null);
+        setWorkflowStatus("");
+        setRetrievalStatus("");
+        setPendingPages(0);
+        setChatReady(false);
+        setSelectedSavedPdfId("");
+        setTab("index");
+      }
+      await fetchSavedPdfs(pdfSearch);
+      await fetchQueues();
+    } catch (err) {
+      setError("Error: " + err.message);
+    } finally {
+      setLoading(false);
+      setLoadingStep("");
+      setConfirmDeletePdf(null);
+    }
+  };
+
   const runAllDeferredQueue = async () => {
     setError("");
     setLoading(true);
@@ -1072,6 +1134,7 @@ export default function App() {
   };
 
   const runner = queueSnapshot.runner || {};
+  const indexRunner = queueSnapshot.index_runner || {};
   const heartbeatAgeSeconds = runner.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - runner.heartbeat_ts)) : 0;
   const runnerLooksStuck = Boolean(runner.running && heartbeatAgeSeconds > 90);
   const runnerStopping = Boolean(runner.running && runner.pause_requested);
@@ -1151,27 +1214,48 @@ export default function App() {
                 <div className="section-count">{savedPdfs.length} saved PDFs</div>
               </div>
               <div className="saved-pdf-list">
-                {savedPdfs.slice(0, 8).map((item) => (
-                  <button
-                    key={item.pdf_id}
-                    type="button"
-                    onClick={() => loadSavedPdf(item.pdf_id)}
-                    className={`saved-pdf-card ${item.pdf_id === selectedSavedPdfId ? "selected" : ""}`}
-                  >
-                    <div className="saved-pdf-title">{item.cnr_number || item.filename}</div>
-                    <div className="saved-pdf-meta">{item.filename} ? {item.total_pages || 0} pages</div>
-                    <div className="saved-pdf-tags">
-                      <span>status: {item.status}</span>
-                      <span>retrieval: {item.retrieval_status}</span>
-                      <span>pending: {item.pending_pages || 0}</span>
-                    </div>
-                    <div className="saved-pdf-note">
-                      {item.pending_pages > 0
-                        ? "Stage 1 is saved. You can process pending pages now or leave this PDF in the queue."
-                        : "This PDF is fully ready in the backend library."}
-                    </div>
-                  </button>
-                ))}
+                {savedPdfs.map((item) => {
+                  const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
+                  const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
+                  const deleteDisabled = loading || isDeferredBusy || isIndexBusy;
+                  return (
+                    <button
+                      key={item.pdf_id}
+                      type="button"
+                      onClick={() => loadSavedPdf(item.pdf_id)}
+                      className={`saved-pdf-card ${item.pdf_id === selectedSavedPdfId ? "selected" : ""}`}
+                    >
+                      <div className="saved-pdf-row">
+                        <div className="saved-pdf-title">{item.cnr_number || item.filename}</div>
+                        <button
+                          type="button"
+                          className="saved-pdf-delete"
+                          disabled={deleteDisabled}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConfirmDeletePdf(item);
+                          }}
+                          title={deleteDisabled ? "This PDF is currently being processed" : "Delete this PDF and all saved data"}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                      <div className="saved-pdf-meta">{item.filename} ? {item.total_pages || 0} pages</div>
+                      <div className="saved-pdf-tags">
+                        <span>status: {item.status}</span>
+                        <span>retrieval: {item.retrieval_status}</span>
+                        <span>pending: {item.pending_pages || 0}</span>
+                      </div>
+                      <div className="saved-pdf-note">
+                        {isDeferredBusy || isIndexBusy
+                          ? "This PDF is currently being processed, so deletion is temporarily locked."
+                          : item.pending_pages > 0
+                            ? "Stage 1 is saved. You can process pending pages now or leave this PDF in the queue."
+                            : "This PDF is fully ready in the backend library."}
+                      </div>
+                    </button>
+                  );
+                })}
                 {savedPdfs.length === 0 && (
                   <div className="saved-pdf-empty">No saved PDFs yet. Upload one or use batch upload.</div>
                 )}
@@ -1190,6 +1274,9 @@ export default function App() {
                 <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
                 {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
                   <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
+                )}
+                {indexRunner.running && (
+                  <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
                 )}
               </div>
               <div className="queue-actions-grid">
@@ -1286,8 +1373,8 @@ export default function App() {
                     disabled={!pdfDoc || loading}
                   />
                 </div>
-                <button className="start-index-btn" onClick={startIndexing} disabled={!pdfDoc || loading}>
-                  {loading ? "Indexing..." : "Start Indexing"}
+                <button className="start-index-btn" onClick={startIndexing} disabled={!pdfDoc || loading || indexRunner.running}>
+                  {loading ? "Starting..." : indexRunner.running ? "Indexing In Background..." : "Start Indexing"}
                 </button>
                 {pdfId && pendingPages > 0 && (
                   <button className="start-index-btn" onClick={processPendingPages} disabled={loading}>
@@ -1508,6 +1595,14 @@ export default function App() {
           message={`Delete "${sections[confirmIdx]?.title}"?`}
           onConfirm={() => handleDelete(confirmIdx)}
           onCancel={() => setConfirmIdx(null)}
+        />
+      )}
+
+      {confirmDeletePdf && (
+        <ConfirmModal
+          message={`Delete "${confirmDeletePdf.cnr_number || confirmDeletePdf.filename}" and erase its saved index, vectors, cached pages, and stored PDF?`}
+          onConfirm={() => deleteSavedPdf(confirmDeletePdf)}
+          onCancel={() => setConfirmDeletePdf(null)}
         />
       )}
     </div>
