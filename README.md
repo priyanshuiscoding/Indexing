@@ -53,12 +53,15 @@ Verify: `tesseract --version`
 Go into `court-rag/backend/` and create a file named `.env`:
 
 ```
-NVIDIA_API_KEY=nvapi-your-key-here
-VISION_MODEL=mistralai/mistral-small-3.1-24b-instruct-2503
-TEXT_MODEL=mistralai/mistral-small-3.1-24b-instruct-2503
-NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+LOCAL_LLM_BASE_URL=http://127.0.0.1:11434
+LOCAL_TEXT_MODEL=qwen2.5:14b
+LOCAL_VISION_MODEL=qwen2.5vl:7b
+LOCAL_LLM_TIMEOUT=180
 CHROMA_DB_PATH=./chroma_db
+PDF_STORAGE_PATH=./stored_pdfs
+INDEX_EXPORT_PATH=./index_exports
 TESSERACT_LANG=hin+eng
+ENABLE_HANDWRITTEN_HINDI_ASSIST=true
 ```
 
 ### Step 2 — Install Python dependencies
@@ -75,7 +78,6 @@ This will take 5–10 minutes the first time. It downloads:
 - Pytesseract (OCR)
 - ChromaDB (vector database)
 - sentence-transformers (local embedding model — ~90MB download)
-- openai SDK (to call NVIDIA API)
 
 ### Step 3 — Install frontend dependencies
 
@@ -187,8 +189,11 @@ pip install pymupdf
 The sentence-transformers model downloads automatically on first run (~90MB).
 If it fails, check your internet connection and run again.
 
-### "NVIDIA API error 401"
-Your API key is wrong or not set. Check `backend/.env` and make sure the key is stored as `nvapi-...` without a `Bearer ` prefix.
+### "Local text model request failed"
+Make sure Ollama is running and that the model names in `backend/.env` are already pulled locally.
+
+### "Local vision model request failed"
+The vision model is missing or not loaded. Pull the model from the Ollama terminal and restart the backend.
 
 ### Frontend can't reach backend (network error)
 Make sure the backend is running on port 8000. Check Terminal 1.
@@ -223,3 +228,27 @@ npm start
 
 PDFs you've already uploaded are remembered in `chroma_db/` — you don't need to re-upload them.
 
+
+---
+
+## LOCAL MODEL NOTES
+
+Recommended current setup for this machine:
+- `LOCAL_TEXT_MODEL=qwen2.5:14b`
+- `LOCAL_VISION_MODEL=qwen2.5vl:7b`
+- `LOCAL_LLM_TIMEOUT=180`
+
+Good optional pulls you can do later:
+- `ollama pull qwen2.5:32b` for stronger text reasoning on a better GPU server
+- `ollama pull gemma3:12b` as an alternate smaller text model for experimentation
+
+Current backend data folders:
+- PDFs: `backend/stored_pdfs`
+- Index JSON exports: `backend/index_exports`
+- Workflow DB: `backend/workflow.db`
+
+Quick backend health check after startup:
+
+```bash
+curl http://127.0.0.1:8000/health
+```

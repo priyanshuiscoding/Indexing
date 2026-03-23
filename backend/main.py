@@ -4,7 +4,7 @@ FastAPI server handling:
   - PDF ingestion (OCR + vectorization)
   - Semantic search / chatbot queries
   - Automatic index generation
-  - NVIDIA API proxy (avoids browser CORS)
+  - Local LLM reasoning and vision assistance
 """
 
 import os
@@ -32,11 +32,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import chromadb
 from chromadb.config import Settings
-from openai import OpenAI
 import httpx
 
 from workflow_state import (
-    DB_PATH as WORKFLOW_DB_PATH,
+    STORAGE_BACKEND as WORKFLOW_STORAGE_BACKEND,
+    STORAGE_TARGET as WORKFLOW_STORAGE_TARGET,
     build_queue_snapshot,
     delete_pdf_state,
     get_cached_pages,
@@ -66,20 +66,13 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 Path(HF_CACHE_PATH).mkdir(parents=True, exist_ok=True)
 DOCUMENT_CATALOG_PATH = Path(__file__).resolve().parent.parent / "document_catalog.json"
 
-def normalize_api_key(raw_value: str) -> str:
-    """Accept keys with accidental quotes or a leading 'Bearer ' prefix."""
-    value = (raw_value or "").strip().strip("\"' ")
-    if value.lower().startswith("bearer "):
-        value = value[7:].strip()
-    return value
-
-
-NVIDIA_API_KEY   = normalize_api_key(os.getenv("NVIDIA_API_KEY", ""))
-VISION_MODEL     = os.getenv("VISION_MODEL", "mistralai/mistral-small-3.1-24b-instruct-2503")
-TEXT_MODEL       = os.getenv("TEXT_MODEL",   "mistralai/mistral-small-3.1-24b-instruct-2503")
-NVIDIA_BASE_URL  = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+LOCAL_LLM_BASE_URL = (os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+LOCAL_TEXT_MODEL = os.getenv("LOCAL_TEXT_MODEL", "qwen2.5:14b")
+LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "qwen2.5vl:7b")
+LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "180"))
 CHROMA_DB_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
+INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
 TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
 ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "true").lower() != "false"
 try:
@@ -113,11 +106,7 @@ NEGATIVE_TOC_MAPPINGS = {
 }
 LOW_CONFIDENCE_TOC_SOURCES = {"toc", "toc-image"}
 
-# ── NVIDIA client ──────────────────────────────────────────────────────────────
-nvidia_client = OpenAI(
-    base_url=NVIDIA_BASE_URL,
-    api_key=NVIDIA_API_KEY,
-)
+# Local LLM configuration
 
 # ── Embedding model (local, offline, Hindi+English) ───────────────────────────
 embedder = None
@@ -152,6 +141,7 @@ index_runner_status = {
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
 Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
 Path(PDF_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
+Path(INDEX_EXPORT_PATH).mkdir(parents=True, exist_ok=True)
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_DB_PATH,
     settings=Settings(anonymized_telemetry=False),
@@ -180,6 +170,44 @@ def pdf_id_from_bytes(data: bytes) -> str:
 def stored_pdf_path(pdf_id: str) -> Path:
     """Local on-disk copy of the uploaded PDF for later page-image reprocessing."""
     return Path(PDF_STORAGE_PATH) / f"{pdf_id}.pdf"
+
+
+def sanitize_export_stem(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\|?*\x00-\x1f]+', "_", (value or "").strip())
+    return cleaned.strip(" .") or "index"
+
+
+def export_index_json(
+    pdf_id: str,
+    record: Optional[dict],
+    index_items: list[dict],
+    indexed_start: int,
+    indexed_end: int,
+    total_pages: int,
+    index_source: str,
+) -> Path:
+    cnr_number = (
+        (record or {}).get("cnr_number")
+        or cnr_number_from_filename((record or {}).get("filename", ""))
+        or pdf_id
+    )
+    payload = {
+        "pdf_id": pdf_id,
+        "cnr_number": cnr_number,
+        "file_number": cnr_number,
+        "filename": (record or {}).get("filename", ""),
+        "total_pages": total_pages,
+        "indexed_page_start": indexed_start,
+        "indexed_page_end": indexed_end,
+        "indexed_pages": max(indexed_end - indexed_start + 1, 0),
+        "index_source": index_source,
+        "status": (record or {}).get("status", "index_ready"),
+        "index_entries": len(index_items or []),
+        "index": index_items or [],
+    }
+    export_path = Path(INDEX_EXPORT_PATH) / f"{sanitize_export_stem(cnr_number)}.json"
+    export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return export_path
 
 
 def get_or_create_collection(pdf_id: str):
@@ -308,7 +336,7 @@ def should_try_handwritten_assist(direct_text: str, ocr_text: str) -> bool:
 
 def extract_handwritten_page_text(image: Image.Image, page_num: int) -> Optional[str]:
     """Use the vision model as a higher-accuracy fallback for handwritten Hindi/English pages."""
-    if not ENABLE_HANDWRITTEN_HINDI_ASSIST or not NVIDIA_API_KEY:
+    if not ENABLE_HANDWRITTEN_HINDI_ASSIST or not LOCAL_VISION_MODEL:
         return None
 
     prompt = f"""You are transcribing a scanned Indian court-file page.
@@ -327,7 +355,7 @@ Rules:
 Return only the transcription for page {page_num}."""
     try:
         image_b64 = image_to_jpeg_base64(image)
-        text = call_nvidia_vision(image_b64, "image/jpeg", prompt, max_tokens=2200).strip()
+        text = call_local_vision(image_b64, "image/jpeg", prompt, max_tokens=2200).strip()
         return text or None
     except Exception as exc:
         log.warning("Vision transcription failed for page %s: %s", page_num, exc)
@@ -381,7 +409,7 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict
 
 def extract_toc_from_page_images(pdf_path: Path, page_nums: list[int]) -> list[dict]:
     """Use page images for TOC extraction when a likely Hindi/English index page is found."""
-    if not page_nums or not pdf_path.exists() or not NVIDIA_API_KEY:
+    if not page_nums or not pdf_path.exists() or not LOCAL_VISION_MODEL:
         return []
 
     toc_items = []
@@ -422,7 +450,12 @@ Return only valid JSON:
     "source": "toc-image"
   }}
 ]"""
-            raw = call_nvidia_vision(image_b64, "image/jpeg", prompt, max_tokens=2600)
+            try:
+                raw = call_local_vision(image_b64, "image/jpeg", prompt, max_tokens=2600)
+            except HTTPException as exc:
+                log.warning("Skipping TOC image parsing for page %s after local vision failure: %s", page_num, exc.detail)
+                continue
+
             parsed = safe_json(raw)
             if isinstance(parsed, list) and parsed:
                 for row in parsed:
@@ -435,32 +468,61 @@ Return only valid JSON:
     return toc_items
 
 
-def call_nvidia_text(messages: list[dict], max_tokens: int = 2000, temperature: float = 0.1) -> str:
-    """Call NVIDIA text model (no image). Used for RAG reasoning."""
-    resp = nvidia_client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content or ""
+def call_local_text(messages: list[dict], max_tokens: int = 2000, temperature: float = 0.1) -> str:
+    """Call the configured local chat model for text-only reasoning tasks."""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=LOCAL_LLM_TIMEOUT, write=LOCAL_LLM_TIMEOUT, pool=LOCAL_LLM_TIMEOUT)) as client:
+            resp = client.post(
+                f"{LOCAL_LLM_BASE_URL}/api/chat",
+                json={
+                    "model": LOCAL_TEXT_MODEL,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens,
+                    },
+                },
+            )
+            resp.raise_for_status()
+    except Exception as exc:
+        log.exception("Local text model request failed")
+        raise HTTPException(503, f"Local text model request failed: {exc}")
+
+    data = resp.json()
+    return ((data.get("message") or {}).get("content") or "").strip()
 
 
-def call_nvidia_vision(image_b64: str, media_type: str, prompt: str, max_tokens: int = 2000) -> str:
-    """Call NVIDIA vision model with a single image (Mistral limit = 1 image)."""
-    resp = nvidia_client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
-        max_tokens=max_tokens,
-        temperature=0.1,
-    )
-    return resp.choices[0].message.content or ""
+def call_local_vision(image_b64: str, media_type: str, prompt: str, max_tokens: int = 2000) -> str:
+    """Call the configured local vision model with a single page image."""
+    del media_type
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=LOCAL_LLM_TIMEOUT, write=LOCAL_LLM_TIMEOUT, pool=LOCAL_LLM_TIMEOUT)) as client:
+            resp = client.post(
+                f"{LOCAL_LLM_BASE_URL}/api/chat",
+                json={
+                    "model": LOCAL_VISION_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [image_b64],
+                        }
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": max_tokens,
+                    },
+                },
+            )
+            resp.raise_for_status()
+    except Exception as exc:
+        log.exception("Local vision model request failed")
+        raise HTTPException(503, f"Local vision model request failed: {exc}")
+
+    data = resp.json()
+    return ((data.get("message") or {}).get("content") or "").strip()
 
 
 def safe_json(text: str):
@@ -942,7 +1004,7 @@ Important rules:
 Return only JSON:
 {{"title": "one exact candidate name"}}"""
 
-    raw = call_nvidia_text(
+    raw = call_local_text(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=200,
         temperature=0.0,
@@ -1029,12 +1091,6 @@ class QueryRequest(BaseModel):
 
 class IndexRequest(BaseModel):
     pdf_id: str
-
-class NvidiaProxyRequest(BaseModel):
-    model: str
-    messages: list
-    max_tokens: int = 2000
-    temperature: float = 0.1
 
 class TextTransformRequest(BaseModel):
     text: str
@@ -1152,10 +1208,12 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
 def health():
     return {
         "status": "ok",
-        "models": {"vision": VISION_MODEL, "text": TEXT_MODEL},
+        "models": {"vision": LOCAL_VISION_MODEL, "text": LOCAL_TEXT_MODEL},
+        "llm_base_url": LOCAL_LLM_BASE_URL,
         "embedding_ready": embedder is not None,
-        "handwritten_hindi_assist": ENABLE_HANDWRITTEN_HINDI_ASSIST and bool(NVIDIA_API_KEY),
-        "workflow_db": str(WORKFLOW_DB_PATH),
+        "handwritten_hindi_assist": ENABLE_HANDWRITTEN_HINDI_ASSIST and bool(LOCAL_VISION_MODEL),
+        "workflow_storage_backend": WORKFLOW_STORAGE_BACKEND,
+        "workflow_storage_target": WORKFLOW_STORAGE_TARGET,
     }
 
 
@@ -1414,7 +1472,7 @@ Relevant pages from the document:
 Please answer the question based on the above pages. Mention page numbers.
 If the current page appears relevant, prioritize that page and its nearby pages."""
 
-    answer = call_nvidia_text(
+    answer = call_local_text(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -1511,7 +1569,7 @@ Return only valid JSON:
   }}
 ]"""
 
-        toc_raw = call_nvidia_text(
+        toc_raw = call_local_text(
             messages=[{"role": "user", "content": toc_prompt}],
             max_tokens=3500,
         )
@@ -1566,7 +1624,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
   }}
 ]"""
 
-        raw = call_nvidia_text(
+        raw = call_local_text(
             messages=[{"role": "user", "content": scan_prompt}],
             max_tokens=2000,
         )
@@ -1643,6 +1701,16 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         )
         record = get_pdf_record(req.pdf_id)
 
+    export_path = export_index_json(
+        pdf_id=req.pdf_id,
+        record=record,
+        index_items=classified_final,
+        indexed_start=indexed_start,
+        indexed_end=indexed_end,
+        total_pages=total_pages,
+        index_source=index_source,
+    )
+
     return {
         "index": classified_final,
         "total_pages": total_pages,
@@ -1656,6 +1724,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         "retrieval_status": record["retrieval_status"] if record else "legacy",
         "pending_pages": record["pending_pages"] if record else max(total_pages - total_chunks, 0),
         "chat_ready": record["chat_ready"] if record else True,
+        "index_export_file": str(export_path),
     }
 
 
@@ -2090,7 +2159,7 @@ async def delete_pdf(pdf_id: str):
         raise HTTPException(404, f"PDF {pdf_id} not found")
 
 
-# ── 7. NVIDIA PROXY (for vision calls from frontend) ─────────────────────────
+# 7. TEXT TRANSFORM
 @app.post("/api/text-transform")
 async def text_transform(req: TextTransformRequest):
     source_text = (req.text or "").strip()
@@ -2121,7 +2190,7 @@ Rules:
 Return only the transliterated text."""
         user_prompt = f"Transliterate this text into Roman script without translating it:\n\n{source_text}"
 
-    transformed = call_nvidia_text(
+    transformed = call_local_text(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -2136,38 +2205,14 @@ Return only the transliterated text."""
     }
 
 
-@app.post("/api/nvidia-proxy")
-async def nvidia_proxy(req: NvidiaProxyRequest):
-    """
-    Proxy for NVIDIA API calls from the frontend.
-    Adds the API key server-side so it never goes to the browser.
-    """
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{NVIDIA_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {NVIDIA_API_KEY}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":       req.model,
-                "messages":    req.messages,
-                "max_tokens":  req.max_tokens,
-                "temperature": req.temperature,
-            },
-        )
-    if not resp.is_success:
-        raise HTTPException(resp.status_code, resp.text)
-    return resp.json()
-
-
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
-    if not NVIDIA_API_KEY:
-        log.warning("NVIDIA_API_KEY is not set — AI features will fail")
-    log.info(f"Vision model : {VISION_MODEL}")
-    log.info(f"Text model   : {TEXT_MODEL}")
+    if not LOCAL_TEXT_MODEL:
+        log.warning("LOCAL_TEXT_MODEL is not set - AI features will fail")
+    log.info(f"Local LLM URL: {LOCAL_LLM_BASE_URL}")
+    log.info(f"Vision model : {LOCAL_VISION_MODEL}")
+    log.info(f"Text model   : {LOCAL_TEXT_MODEL}")
     log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
     log.info("Server ready")

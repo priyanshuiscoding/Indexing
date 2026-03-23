@@ -19,6 +19,7 @@ chroma_db/
 stored_pdfs/
 backend/chroma_db/
 backend/stored_pdfs/
+backend/index_exports/
 
 # OS / misc
 .DS_Store
