@@ -949,17 +949,101 @@ def score_toc_features(features: dict) -> int:
     )
 
 
+TOC_POSITIVE_PAGE_PATTERNS = [
+    (r"\bindex\b", 90),
+    (r"table of contents", 90),
+    (r"\bs\.?\s*no\b", 35),
+    (r"\bdescription of (?:the )?documents\b", 55),
+    (r"\bannexures?\b", 35),
+    (r"\bpages?\b", 20),
+    (r"\bchronology of events\b", 12),
+]
+TOC_NEGATIVE_PAGE_PATTERNS = [
+    (r"\bscrutiny report\b", 120),
+    (r"\bcomputer sheet\b", 90),
+    (r"\boffice note\b", 75),
+    (r"\bthe defaults?\b", 60),
+    (r"\bcourt fees?\b", 55),
+    (r"\bdescription of relief\b", 45),
+    (r"\blistable before\b", 35),
+]
+
+
+def explicit_toc_page_score(text: str, features: dict) -> int:
+    lower = (text or "").lower()
+    score = score_toc_features(features)
+    for pattern, weight in TOC_POSITIVE_PAGE_PATTERNS:
+        if re.search(pattern, lower, flags=re.IGNORECASE):
+            score += weight
+    for pattern, penalty in TOC_NEGATIVE_PAGE_PATTERNS:
+        if re.search(pattern, lower, flags=re.IGNORECASE):
+            score -= penalty
+    if features.get("header_hits", 0) >= 2 and features.get("numbered_row_lines", 0) >= 2:
+        score += 40
+    if features.get("marker_hits", 0) >= 1 and features.get("header_hits", 0) >= 1:
+        score += 35
+    return score
+
+
+def has_explicit_toc_signal(text: str, features: dict) -> bool:
+    lower = (text or "").lower()
+    return (
+        bool(re.search(r"\bindex\b", lower, flags=re.IGNORECASE))
+        or bool(re.search(r"table of contents", lower, flags=re.IGNORECASE))
+        or (
+            bool(re.search(r"\bdescription of (?:the )?documents\b", lower, flags=re.IGNORECASE))
+            and bool(re.search(r"\bannexures?\b", lower, flags=re.IGNORECASE))
+        )
+        or (features.get("header_hits", 0) >= 2 and features.get("numbered_row_lines", 0) >= 2)
+    )
+
+
 def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]) -> list[dict]:
     ranked = []
     for page in candidate_pages:
-        features = analyze_toc_page_features(page.get("text", ""), toc_markers)
+        page_text = page.get("text", "")
+        features = analyze_toc_page_features(page_text, toc_markers)
         ranked.append({
             "page": page,
-            "score": score_toc_features(features),
+            "score": explicit_toc_page_score(page_text, features),
             "features": features,
+            "explicit": has_explicit_toc_signal(page_text, features),
         })
-    ranked.sort(key=lambda item: (-item["score"], item["page"]["page_num"]))
+    ranked.sort(key=lambda item: (-item["score"], not item["explicit"], item["page"]["page_num"]))
     return ranked
+
+
+def select_toc_pages_for_extraction(ranked_pages: list[dict], max_pages: int = 3) -> list[dict]:
+    if not ranked_pages:
+        return []
+
+    pages_by_num = sorted(ranked_pages, key=lambda item: item["page"]["page_num"])
+    best_window = []
+    best_key = None
+
+    for start_idx in range(len(pages_by_num)):
+        window = [pages_by_num[start_idx]]
+        for next_idx in range(start_idx + 1, len(pages_by_num)):
+            previous_page_num = window[-1]["page"]["page_num"]
+            current_page_num = pages_by_num[next_idx]["page"]["page_num"]
+            if current_page_num != previous_page_num + 1:
+                break
+            window.append(pages_by_num[next_idx])
+            if len(window) >= max_pages:
+                break
+
+        candidate_windows = [window[:size] for size in range(1, len(window) + 1)]
+        for candidate in candidate_windows:
+            explicit_count = sum(1 for item in candidate if item.get("explicit"))
+            total_score = sum(item["score"] for item in candidate)
+            window_key = (explicit_count, len(candidate), total_score, -candidate[0]["page"]["page_num"])
+            if best_key is None or window_key > best_key:
+                best_key = window_key
+                best_window = candidate
+
+    if best_window:
+        return [item["page"] for item in best_window[:max_pages]]
+    return [item["page"] for item in ranked_pages[:max_pages]]
 
 
 def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
@@ -2201,12 +2285,20 @@ Return only valid JSON:
         log.info(
             "TOC candidate pages for %s: %s",
             req.pdf_id,
-            [{"page": item["page"]["page_num"], "score": item["score"]} for item in all_candidate_pages],
+            [
+                {
+                    "page": item["page"]["page_num"],
+                    "score": item["score"],
+                    "explicit": item.get("explicit", False),
+                }
+                for item in all_candidate_pages
+            ],
         )
 
-        selected_pages = [item["page"] for item in all_candidate_pages[:3]]
-        fallback_selected_pages = [item["page"] for item in ranked_fallback[:3]]
+        selected_pages = select_toc_pages_for_extraction(all_candidate_pages, max_pages=3)
+        fallback_selected_pages = select_toc_pages_for_extraction(ranked_fallback, max_pages=3)
         fallback_page_nums = [page["page_num"] for page in fallback_selected_pages]
+        log.info("TOC selected pages for %s: primary=%s fallback=%s", req.pdf_id, [page["page_num"] for page in selected_pages], fallback_page_nums)
 
         first_text_pages = selected_pages or fallback_selected_pages
         first_pass = run_toc_extraction(first_text_pages, allow_image_fallback=False, allow_text_llm=True)
