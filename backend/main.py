@@ -17,6 +17,7 @@ import hashlib
 import logging
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from io import BytesIO
 from threading import Lock, Thread
@@ -173,6 +174,85 @@ app.add_middleware(
 # ═════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+TIMING_SUMMARY_ORDER = [
+    "file_open",
+    "first_10_page_extraction",
+    "ocr_time",
+    "toc_detection",
+    "llm_indexing_time",
+    "json_generation_time",
+    "full_text_extraction_time",
+    "chunking_time",
+    "embedding_time",
+    "vector_db_insert_time",
+    "total_vectorization_time",
+]
+
+TIMING_LABELS = {
+    "file_open": "file open",
+    "first_10_page_extraction": "first 10-page extraction",
+    "ocr_time": "OCR time",
+    "toc_detection": "TOC detection",
+    "llm_indexing_time": "LLM indexing time",
+    "json_generation_time": "JSON generation time",
+    "full_text_extraction_time": "full text extraction time",
+    "chunking_time": "chunking time",
+    "embedding_time": "embedding time",
+    "vector_db_insert_time": "vector DB insert time",
+    "total_vectorization_time": "total vectorization time",
+}
+
+
+class StageTimer:
+    def __init__(self, name: str, collector: Optional["PdfTimingCollector"] = None, summary_key: str = ""):
+        self.name = name
+        self.collector = collector
+        self.summary_key = summary_key
+        self.start = None
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        log.info("[START] %s", self.name)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        elapsed = time.perf_counter() - self.start
+        if self.collector and self.summary_key:
+            self.collector.add_duration(self.summary_key, elapsed)
+        log.info("[END] %s took %.3fs", self.name, elapsed)
+
+
+class PdfTimingCollector:
+    def __init__(self, pdf_id: str, filename: str = ""):
+        self.pdf_id = pdf_id
+        self.filename = filename or ""
+        self.timings: dict[str, float] = {}
+
+    def stage(self, name: str, summary_key: str) -> StageTimer:
+        return StageTimer(name, collector=self, summary_key=summary_key)
+
+    def add_duration(self, key: str, elapsed: float):
+        self.timings[key] = self.timings.get(key, 0.0) + elapsed
+
+    def log_summary(self, run_label: str):
+        if not self.timings:
+            return
+        log.info(
+            "[PDF TIMING] Summary for pdf=%s file=%s run=%s",
+            self.pdf_id,
+            self.filename or "-",
+            run_label,
+        )
+        for key in TIMING_SUMMARY_ORDER:
+            if key in self.timings:
+                log.info(
+                    "[PDF TIMING] pdf=%s %s = %.3fs",
+                    self.pdf_id,
+                    TIMING_LABELS.get(key, key),
+                    self.timings[key],
+                )
 
 def pdf_id_from_bytes(data: bytes) -> str:
     """Stable ID for a PDF based on its content hash."""
@@ -374,7 +454,12 @@ Return only the transcription for page {page_num}."""
         return None
 
 
-def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict:
+def extract_page_content(
+    page: fitz.Page,
+    page_num: int,
+    dpi: int = 200,
+    timing_collector: Optional[PdfTimingCollector] = None,
+) -> dict:
     """
     Extract text from a PDF page.
     First tries direct text extraction (fast, perfect for digital PDFs).
@@ -393,6 +478,7 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict
             "extraction_method": "digital",
         }
 
+    ocr_started = time.perf_counter()
     image = render_page_image(page, dpi=dpi)
     ocr_text = ocr_page_image(image)
     vision_used = False
@@ -410,6 +496,9 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict
                 vision_used = True
                 extraction_method = "vision_ocr"
 
+    if timing_collector:
+        timing_collector.add_duration("ocr_time", time.perf_counter() - ocr_started)
+
     return {
         "text": final_text,
         "used_ocr": True,
@@ -417,7 +506,6 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict
         "handwriting_suspected": handwriting_suspected,
         "extraction_method": extraction_method,
     }
-
 
 def extract_toc_from_page_images(pdf_path: Path, page_nums: list[int]) -> list[dict]:
     """Use page images for TOC extraction when a likely Hindi/English index page is found."""
@@ -820,7 +908,13 @@ def combine_toc_items(*groups: list[dict]) -> list[dict]:
     return combined
 
 
-def extract_pages_from_document(doc: fitz.Document, page_numbers: list[int], total_pages: int, dpi: int = 250) -> tuple[list[dict], dict]:
+def extract_pages_from_document(
+    doc: fitz.Document,
+    page_numbers: list[int],
+    total_pages: int,
+    dpi: int = 250,
+    timing_collector: Optional[PdfTimingCollector] = None,
+) -> tuple[list[dict], dict]:
     pages_data = []
     ocr_count = 0
     vision_ocr_count = 0
@@ -828,7 +922,7 @@ def extract_pages_from_document(doc: fitz.Document, page_numbers: list[int], tot
 
     for page_num in page_numbers:
         page = doc[page_num - 1]
-        page_data = extract_page_content(page, page_num, dpi=dpi)
+        page_data = extract_page_content(page, page_num, dpi=dpi, timing_collector=timing_collector)
         text_value = page_data["text"] or f"[Page {page_num} - no readable text detected]"
         if page_data["used_ocr"]:
             ocr_count += 1
@@ -862,7 +956,13 @@ def extract_pages_from_document(doc: fitz.Document, page_numbers: list[int], tot
     }
 
 
-def upsert_collection_pages(pdf_id: str, filename: str, pages_data: list[dict], reset: bool = False):
+def upsert_collection_pages(
+    pdf_id: str,
+    filename: str,
+    pages_data: list[dict],
+    reset: bool = False,
+    timing_collector: Optional[PdfTimingCollector] = None,
+):
     if reset:
         try:
             chroma_client.delete_collection(f"pdf_{pdf_id}")
@@ -873,22 +973,35 @@ def upsert_collection_pages(pdf_id: str, filename: str, pages_data: list[dict], 
         return collection
 
     batch_size = 50
-    for i in range(0, len(pages_data), batch_size):
-        batch = pages_data[i:i + batch_size]
-        ids = [f"{pdf_id}_p{page['page_num']}" for page in batch]
-        documents = [page["text"] for page in batch]
-        metadatas = [{
-            "page_num": page["page_num"],
-            "used_ocr": page["used_ocr"],
-            "vision_used": page["vision_used"],
-            "handwriting_suspected": page["handwriting_suspected"],
-            "extraction_method": page["extraction_method"],
-            "filename": filename,
-        } for page in batch]
-        embeddings = embed_texts(documents)
-        collection.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
-    return collection
+    vectorization_scope = timing_collector.stage("total vectorization", "total_vectorization_time") if timing_collector else nullcontext()
+    with vectorization_scope:
+        for i in range(0, len(pages_data), batch_size):
+            batch = pages_data[i:i + batch_size]
 
+            chunk_started = time.perf_counter()
+            ids = [f"{pdf_id}_p{page['page_num']}" for page in batch]
+            documents = [page["text"] for page in batch]
+            metadatas = [{
+                "page_num": page["page_num"],
+                "used_ocr": page["used_ocr"],
+                "vision_used": page["vision_used"],
+                "handwriting_suspected": page["handwriting_suspected"],
+                "extraction_method": page["extraction_method"],
+                "filename": filename,
+            } for page in batch]
+            if timing_collector:
+                timing_collector.add_duration("chunking_time", time.perf_counter() - chunk_started)
+
+            embedding_started = time.perf_counter()
+            embeddings = embed_texts(documents)
+            if timing_collector:
+                timing_collector.add_duration("embedding_time", time.perf_counter() - embedding_started)
+
+            db_insert_started = time.perf_counter()
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+            if timing_collector:
+                timing_collector.add_duration("vector_db_insert_time", time.perf_counter() - db_insert_started)
+    return collection
 
 def load_collection_pages(pdf_id: str) -> list[dict]:
     try:
@@ -1255,8 +1368,10 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
     pdf_path = stored_pdf_path(pdf_id)
     pdf_path.write_bytes(pdf_bytes)
     log.info("Stage 1 ingest for PDF: %s  id=%s", filename, pdf_id)
+    timing_collector = PdfTimingCollector(pdf_id, filename)
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    with timing_collector.stage("file open", "file_open"):
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = doc.page_count
     if total_pages < 1:
         doc.close()
@@ -1270,11 +1385,14 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         raise HTTPException(400, "Start page must be less than or equal to end page")
 
     selected_page_numbers = list(range(start_page, end_page + 1))
-    pages_data, stats = extract_pages_from_document(doc, selected_page_numbers, total_pages, dpi=250)
-    doc.close()
+    try:
+        with timing_collector.stage("first 10-page extraction", "first_10_page_extraction"):
+            pages_data, stats = extract_pages_from_document(doc, selected_page_numbers, total_pages, dpi=250, timing_collector=timing_collector)
+    finally:
+        doc.close()
 
     replace_extracted_pages(pdf_id, pages_data, stage="fast_index")
-    upsert_collection_pages(pdf_id, filename, pages_data, reset=True)
+    upsert_collection_pages(pdf_id, filename, pages_data, reset=True, timing_collector=timing_collector)
 
     indexed_pages = len(pages_data)
     pending_pages = max(total_pages - indexed_pages, 0)
@@ -1299,6 +1417,8 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         last_error="",
     )
 
+    timing_collector.log_summary("stage_1_ingest")
+
     return {
         "pdf_id": pdf_id,
         "cnr_number": cnr_number,
@@ -1316,7 +1436,6 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         "chat_ready": not bool(pending_pages),
         "filename": filename,
     }
-
 
 @app.get("/health")
 def health():
@@ -1610,6 +1729,7 @@ async def generate_index(req: IndexRequest):
     If a TOC is detected, ranges are expanded deterministically across the whole PDF.
     """
     record = get_pdf_record(req.pdf_id)
+    timing_collector = PdfTimingCollector(req.pdf_id, (record or {}).get("filename", ""))
     all_pages = load_index_pages(req.pdf_id)
     if not all_pages:
         raise HTTPException(404, f"PDF {req.pdf_id} not found. Please ingest first.")
@@ -1691,9 +1811,6 @@ Return only valid JSON:
 
         return toc_page_nums, toc_image_items_local, toc_text_items_local
 
-    toc_candidate_pages = collect_toc_candidate_pages(all_pages, toc_markers, max_pages=6)
-    log.info("Primary TOC candidate pages for %s: %s", req.pdf_id, [page["page_num"] for page in toc_candidate_pages])
-
     index_items = []
     toc_source = ""
     toc_range_end = total_pages if record else indexed_end
@@ -1701,42 +1818,47 @@ Return only valid JSON:
     toc_image_items = []
     toc_text_items = []
 
-    if toc_candidate_pages:
-        toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(toc_candidate_pages)
+    with timing_collector.stage("TOC detection", "toc_detection"):
+        toc_candidate_pages = collect_toc_candidate_pages(all_pages, toc_markers, max_pages=6)
+        log.info("Primary TOC candidate pages for %s: %s", req.pdf_id, [page["page_num"] for page in toc_candidate_pages])
 
-    combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
-    if not combined_toc_items:
-        fallback_toc_pages = collect_toc_fallback_pages(all_pages, toc_markers, max_pages=6)
-        fallback_page_nums = [page["page_num"] for page in fallback_toc_pages]
-        if fallback_page_nums and fallback_page_nums != toc_page_nums:
-            log.info("Retrying TOC extraction with fallback pages for %s: %s", req.pdf_id, fallback_page_nums)
-            toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(fallback_toc_pages)
-            combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
-    if combined_toc_items:
-        index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc")
-        toc_source = "toc-image" if toc_image_items and not toc_text_items else "toc"
-        log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
+        if toc_candidate_pages:
+            toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(toc_candidate_pages)
 
-    scan_chunk = 25
-    auto_items = []
-    uncovered_pages = all_pages if not index_items else []
-    if not index_items:
-        log.info("No TOC found. Scanning %s indexed pages for document boundaries", len(uncovered_pages))
+        combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
+        if not combined_toc_items:
+            fallback_toc_pages = collect_toc_fallback_pages(all_pages, toc_markers, max_pages=6)
+            fallback_page_nums = [page["page_num"] for page in fallback_toc_pages]
+            if fallback_page_nums and fallback_page_nums != toc_page_nums:
+                log.info("Retrying TOC extraction with fallback pages for %s: %s", req.pdf_id, fallback_page_nums)
+                toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(fallback_toc_pages)
+                combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
+        if combined_toc_items:
+            index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc")
+            toc_source = "toc-image" if toc_image_items and not toc_text_items else "toc"
+            log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
 
-    for i in range(0, len(uncovered_pages), scan_chunk):
-        chunk_pages = uncovered_pages[i:i + scan_chunk]
-        if not chunk_pages:
-            continue
+    with timing_collector.stage("LLM indexing", "llm_indexing_time"):
+        scan_chunk = 25
+        auto_items = []
+        uncovered_pages = all_pages if not index_items else []
+        if not index_items:
+            log.info("No TOC found. Scanning %s indexed pages for document boundaries", len(uncovered_pages))
 
-        page_texts = ""
-        for pg in chunk_pages:
-            preview = pg["text"][:300].replace("\n", " ").strip()
-            page_texts += f"Page {pg['page_num']}: {preview}\n"
+        for i in range(0, len(uncovered_pages), scan_chunk):
+            chunk_pages = uncovered_pages[i:i + scan_chunk]
+            if not chunk_pages:
+                continue
 
-        from_page = chunk_pages[0]["page_num"]
-        to_page = chunk_pages[-1]["page_num"]
+            page_texts = ""
+            for pg in chunk_pages:
+                preview = pg["text"][:300].replace("\n", " ").strip()
+                page_texts += f"Page {pg['page_num']}: {preview}\n"
 
-        scan_prompt = f"""You are analyzing pages from an Indian court document.
+            from_page = chunk_pages[0]["page_num"]
+            to_page = chunk_pages[-1]["page_num"]
+
+            scan_prompt = f"""You are analyzing pages from an Indian court document.
 Below is extracted text from pages {from_page} to {to_page}.
 Each line shows the page number and a preview of its content.
 
@@ -1757,92 +1879,96 @@ Return ONLY a valid JSON array (empty [] if nothing found):
   }}
 ]"""
 
-        raw = call_local_text(
-            messages=[{"role": "user", "content": scan_prompt}],
-            max_tokens=2000,
-        )
-        parsed = safe_json(raw)
-        if isinstance(parsed, list):
-            for item in parsed:
-                if item.get("title") and len(item["title"]) > 2:
-                    auto_items.append({
-                        **item,
-                        "pageFrom": max(from_page, coerce_page_number(item.get("pageFrom"), from_page)),
-                        "pageTo": min(to_page, coerce_page_number(item.get("pageTo"), to_page)),
-                        "source": "auto",
-                    })
+            raw = call_local_text(
+                messages=[{"role": "user", "content": scan_prompt}],
+                max_tokens=2000,
+            )
+            parsed = safe_json(raw)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if item.get("title") and len(item["title"]) > 2:
+                        auto_items.append({
+                            **item,
+                            "pageFrom": max(from_page, coerce_page_number(item.get("pageFrom"), from_page)),
+                            "pageTo": min(to_page, coerce_page_number(item.get("pageTo"), to_page)),
+                            "source": "auto",
+                        })
 
-    all_items = index_items + auto_items
-    all_items.sort(key=lambda item: item.get("pageFrom", 0))
+        all_items = index_items + auto_items
+        all_items.sort(key=lambda item: item.get("pageFrom", 0))
 
-    final = []
-    cursor = indexed_start
-    final_range_end = total_pages if index_items else indexed_end
-    for item in all_items:
-        pf = coerce_page_number(item.get("pageFrom"), cursor)
-        pt = coerce_page_number(item.get("pageTo"), pf)
-        if pt < pf:
-            pt = pf
-        if pf > cursor:
+        final = []
+        cursor = indexed_start
+        final_range_end = total_pages if index_items else indexed_end
+        for item in all_items:
+            pf = coerce_page_number(item.get("pageFrom"), cursor)
+            pt = coerce_page_number(item.get("pageTo"), pf)
+            if pt < pf:
+                pt = pf
+            if pf > cursor:
+                final.append({
+                    "title": f"Pages {cursor}-{pf - 1}",
+                    "displayTitle": f"Pages {cursor}-{pf - 1}",
+                    "originalTitle": f"Pages {cursor}-{pf - 1}",
+                    "pageFrom": cursor,
+                    "pageTo": pf - 1,
+                    "source": "gap",
+                    "serialNo": "",
+                    "courtFee": "",
+                })
+            if pf >= cursor:
+                final.append({
+                    "title": item.get("title", f"Pages {pf}-{pt}"),
+                    "displayTitle": item.get("displayTitle") or item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
+                    "originalTitle": item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
+                    "pageFrom": pf,
+                    "pageTo": pt,
+                    "source": item.get("source", "auto"),
+                    "serialNo": str(item.get("serialNo", "")),
+                    "courtFee": str(item.get("courtFee", "")),
+                })
+                cursor = pt + 1
+
+        if cursor <= final_range_end:
             final.append({
-                "title": f"Pages {cursor}-{pf - 1}",
-                "displayTitle": f"Pages {cursor}-{pf - 1}",
-                "originalTitle": f"Pages {cursor}-{pf - 1}",
+                "title": f"Pages {cursor}-{final_range_end}",
+                "displayTitle": f"Pages {cursor}-{final_range_end}",
+                "originalTitle": f"Pages {cursor}-{final_range_end}",
                 "pageFrom": cursor,
-                "pageTo": pf - 1,
+                "pageTo": final_range_end,
                 "source": "gap",
                 "serialNo": "",
                 "courtFee": "",
             })
-        if pf >= cursor:
-            final.append({
-                "title": item.get("title", f"Pages {pf}-{pt}"),
-                "displayTitle": item.get("displayTitle") or item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
-                "originalTitle": item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
-                "pageFrom": pf,
-                "pageTo": pt,
-                "source": item.get("source", "auto"),
-                "serialNo": str(item.get("serialNo", "")),
-                "courtFee": str(item.get("courtFee", "")),
-            })
-            cursor = pt + 1
 
-    if cursor <= final_range_end:
-        final.append({
-            "title": f"Pages {cursor}-{final_range_end}",
-            "displayTitle": f"Pages {cursor}-{final_range_end}",
-            "originalTitle": f"Pages {cursor}-{final_range_end}",
-            "pageFrom": cursor,
-            "pageTo": final_range_end,
-            "source": "gap",
-            "serialNo": "",
-            "courtFee": "",
-        })
+        classified_final = classify_index_to_parent_documents(final, all_pages)
+        index_source = toc_source or ("toc" if index_items else "auto")
 
-    classified_final = classify_index_to_parent_documents(final, all_pages)
-    index_source = toc_source or ("toc" if index_items else "auto")
-    save_index(req.pdf_id, classified_final)
+    with timing_collector.stage("JSON generation", "json_generation_time"):
+        save_index(req.pdf_id, classified_final)
 
-    if record:
-        update_pdf_record(
-            req.pdf_id,
-            status="index_ready",
-            index_ready=True,
+        if record:
+            update_pdf_record(
+                req.pdf_id,
+                status="index_ready",
+                index_ready=True,
+                index_source=index_source,
+                queue_bucket="deferred" if record.get("pending_pages", 0) > 0 else "library",
+                deferred_decision="pending" if record.get("pending_pages", 0) > 0 else "completed",
+            )
+            record = get_pdf_record(req.pdf_id)
+
+        export_path = export_index_json(
+            pdf_id=req.pdf_id,
+            record=record,
+            index_items=classified_final,
+            indexed_start=indexed_start,
+            indexed_end=indexed_end,
+            total_pages=total_pages,
             index_source=index_source,
-            queue_bucket="deferred" if record.get("pending_pages", 0) > 0 else "library",
-            deferred_decision="pending" if record.get("pending_pages", 0) > 0 else "completed",
         )
-        record = get_pdf_record(req.pdf_id)
 
-    export_path = export_index_json(
-        pdf_id=req.pdf_id,
-        record=record,
-        index_items=classified_final,
-        indexed_start=indexed_start,
-        indexed_end=indexed_end,
-        total_pages=total_pages,
-        index_source=index_source,
-    )
+    timing_collector.log_summary("index_generation")
 
     return {
         "index": classified_final,
@@ -1859,7 +1985,6 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         "chat_ready": record["chat_ready"] if record else True,
         "index_export_file": str(export_path),
     }
-
 
 # -- 4. GET PAGE TEXT ──────────────────────────────────────────────────────────
 @app.get("/api/page-text/{pdf_id}/{page_num}")
@@ -2084,14 +2209,17 @@ def process_pending_pdf_impl(pdf_id: str):
         raise HTTPException(404, f"Stored PDF for {pdf_id} not found")
 
     update_pdf_record(pdf_id, status="full_ingestion_running", retrieval_status="full_ingestion_running")
-    doc = fitz.open(pdf_path)
+    timing_collector = PdfTimingCollector(pdf_id, record.get("filename", ""))
+    with timing_collector.stage("file open", "file_open"):
+        doc = fitz.open(pdf_path)
     try:
-        pages_data, stats = extract_pages_from_document(doc, pending_page_numbers, record["total_pages"], dpi=250)
+        with timing_collector.stage("full text extraction", "full_text_extraction_time"):
+            pages_data, stats = extract_pages_from_document(doc, pending_page_numbers, record["total_pages"], dpi=250, timing_collector=timing_collector)
     finally:
         doc.close()
 
     upsert_extracted_pages(pdf_id, pages_data, stage="deferred_ingestion")
-    upsert_collection_pages(pdf_id, record["filename"], pages_data, reset=False)
+    upsert_collection_pages(pdf_id, record["filename"], pages_data, reset=False, timing_collector=timing_collector)
 
     updated_indexed_pages = len(get_cached_pages(pdf_id))
     update_pdf_record(
@@ -2106,6 +2234,8 @@ def process_pending_pdf_impl(pdf_id: str):
         last_error="",
     )
 
+    timing_collector.log_summary("deferred_vectorization")
+
     return {
         "pdf_id": pdf_id,
         "status": "vectorized",
@@ -2118,7 +2248,6 @@ def process_pending_pdf_impl(pdf_id: str):
         "handwriting_suspected_pages": stats["handwriting_suspected_pages"],
         "chat_ready": True,
     }
-
 
 def run_deferred_queue_worker(pdf_ids: list[str]):
     deferred_runner_status.update({
