@@ -23,6 +23,11 @@ from io import BytesIO
 from threading import Lock, Thread
 from typing import Optional
 
+try:
+    import torch
+except Exception:
+    torch = None
+
 import fitz                        # PyMuPDF
 import pytesseract
 from PIL import Image
@@ -76,6 +81,10 @@ PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
 INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
 TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
 ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "true").lower() != "false"
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+EMBEDDING_BATCH_SIZE = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "64")))
+VECTOR_DB_BATCH_SIZE = max(1, int(os.getenv("VECTOR_DB_BATCH_SIZE", "128")))
+PREFER_CUDA_EMBEDDINGS = os.getenv("PREFER_CUDA_EMBEDDINGS", "true").lower() != "false"
 try:
     PARENT_DOCUMENT_CATALOG = json.loads(DOCUMENT_CATALOG_PATH.read_text(encoding="utf-8"))
 except Exception:
@@ -123,6 +132,7 @@ TOC_TABLE_HEADER_PATTERNS = [
 
 # ── Embedding model (local, offline, Hindi+English) ───────────────────────────
 embedder = None
+embedder_device = "cpu"
 embedder_lock = Lock()
 
 deferred_runner_lock = Lock()
@@ -314,23 +324,41 @@ def get_or_create_collection(pdf_id: str):
         )
 
 
+def resolve_embedding_device() -> str:
+    if PREFER_CUDA_EMBEDDINGS and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def get_embedder_device() -> str:
+    return embedder_device or "cpu"
+
+
 def get_embedder():
-    """Load the embedding model only when vector work is actually needed."""
-    global embedder
+    """Load the embedding model once and keep it pinned to the preferred device."""
+    global embedder, embedder_device
     if embedder is None:
         with embedder_lock:
             if embedder is None:
                 try:
                     from sentence_transformers import SentenceTransformer
 
-                    log.info("Loading embedding model...")
+                    preferred_device = resolve_embedding_device()
+                    log.info("Loading embedding model '%s' on device=%s", EMBEDDING_MODEL_NAME, preferred_device)
                     embedder = SentenceTransformer(
-                        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                        EMBEDDING_MODEL_NAME,
                         cache_folder=HF_CACHE_PATH,
+                        device=preferred_device,
                     )
-                    log.info("Embedding model ready")
+                    embedder_device = str(getattr(embedder, "device", None) or getattr(embedder, "_target_device", preferred_device) or preferred_device)
+                    log.info("Embedding model ready on device=%s", embedder_device)
                 except Exception as e:
                     embedder = False
+                    embedder_device = "fallback-cpu"
                     log.exception("Falling back to lightweight local embeddings: %s", e)
     return embedder
 
@@ -351,13 +379,47 @@ def fallback_embed_texts(texts: list[str], dims: int = 384) -> list[list[float]]
     return vectors
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a list of strings using the local multilingual model."""
+def embed_texts(texts: list[str], batch_size: Optional[int] = None, pdf_id: str = "") -> list[list[float]]:
+    """Embed a list of strings using the local multilingual model in GPU-friendly batches."""
     model = get_embedder()
-    if model is False:
-        return fallback_embed_texts(texts)
-    vecs = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-    return vecs.tolist()
+    effective_batch_size = max(1, int(batch_size or EMBEDDING_BATCH_SIZE))
+    if not texts:
+        return []
+
+    log.info(
+        "[VECTORIZE] pdf=%s total_chunks=%s embedding_device=%s embedding_batch_size=%s",
+        pdf_id or "-",
+        len(texts),
+        get_embedder_device(),
+        effective_batch_size,
+    )
+
+    embeddings: list[list[float]] = []
+    total_batches = math.ceil(len(texts) / effective_batch_size)
+    for batch_index in range(0, len(texts), effective_batch_size):
+        batch_texts = texts[batch_index:batch_index + effective_batch_size]
+        started = time.perf_counter()
+        if model is False:
+            batch_vectors = fallback_embed_texts(batch_texts)
+        else:
+            batch_vectors = model.encode(
+                batch_texts,
+                batch_size=effective_batch_size,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            ).tolist()
+        elapsed = time.perf_counter() - started
+        log.info(
+            "[VECTORIZE] pdf=%s embedding batch %s/%s size=%s took %.3fs",
+            pdf_id or "-",
+            (batch_index // effective_batch_size) + 1,
+            total_batches,
+            len(batch_texts),
+            elapsed,
+        )
+        embeddings.extend(batch_vectors)
+    return embeddings
 
 
 def ocr_page_image(image: Image.Image) -> str:
@@ -1333,12 +1395,40 @@ def extract_pages_from_document(
             len(text_value),
         )
 
-    return pages_data, {
+    stats = {
         "ocr_pages": ocr_count,
         "vision_ocr_pages": vision_ocr_count,
         "handwriting_suspected_pages": handwriting_count,
         "digital_pages": len(page_numbers) - ocr_count,
+        "total_pages_processed": len(page_numbers),
+        "skipped_ocr_pages": len(page_numbers) - ocr_count,
     }
+    log.info(
+        "[VECTORIZE] extraction summary total_pages=%s ocr_pages=%s skipped_ocr_pages=%s vision_pages=%s",
+        stats["total_pages_processed"],
+        stats["ocr_pages"],
+        stats["skipped_ocr_pages"],
+        stats["vision_ocr_pages"],
+    )
+    return pages_data, stats
+
+
+def build_vector_chunks(pdf_id: str, filename: str, pages_data: list[dict]) -> list[dict]:
+    chunks = []
+    for page in pages_data:
+        chunks.append({
+            "id": f"{pdf_id}_p{page['page_num']}",
+            "text": page["text"],
+            "metadata": {
+                "page_num": page["page_num"],
+                "used_ocr": page["used_ocr"],
+                "vision_used": page["vision_used"],
+                "handwriting_suspected": page["handwriting_suspected"],
+                "extraction_method": page["extraction_method"],
+                "filename": filename,
+            },
+        })
+    return chunks
 
 
 def upsert_collection_pages(
@@ -1357,35 +1447,52 @@ def upsert_collection_pages(
     if not pages_data:
         return collection
 
-    batch_size = 50
+    vector_chunks = build_vector_chunks(pdf_id, filename, pages_data)
+    total_chunks = len(vector_chunks)
+    batch_size = VECTOR_DB_BATCH_SIZE
+    log.info(
+        "[VECTORIZE] pdf=%s total_chunks=%s db_batch_size=%s embedding_batch_size=%s embedding_device=%s",
+        pdf_id,
+        total_chunks,
+        batch_size,
+        EMBEDDING_BATCH_SIZE,
+        get_embedder_device(),
+    )
+
     vectorization_scope = timing_collector.stage("total vectorization", "total_vectorization_time") if timing_collector else nullcontext()
     with vectorization_scope:
-        for i in range(0, len(pages_data), batch_size):
-            batch = pages_data[i:i + batch_size]
+        chunk_started = time.perf_counter()
+        if timing_collector:
+            timing_collector.add_duration("chunking_time", time.perf_counter() - chunk_started)
 
-            chunk_started = time.perf_counter()
-            ids = [f"{pdf_id}_p{page['page_num']}" for page in batch]
-            documents = [page["text"] for page in batch]
-            metadatas = [{
-                "page_num": page["page_num"],
-                "used_ocr": page["used_ocr"],
-                "vision_used": page["vision_used"],
-                "handwriting_suspected": page["handwriting_suspected"],
-                "extraction_method": page["extraction_method"],
-                "filename": filename,
-            } for page in batch]
-            if timing_collector:
-                timing_collector.add_duration("chunking_time", time.perf_counter() - chunk_started)
+        embedding_started = time.perf_counter()
+        documents = [chunk["text"] for chunk in vector_chunks]
+        embeddings = embed_texts(documents, batch_size=EMBEDDING_BATCH_SIZE, pdf_id=pdf_id)
+        if timing_collector:
+            timing_collector.add_duration("embedding_time", time.perf_counter() - embedding_started)
 
-            embedding_started = time.perf_counter()
-            embeddings = embed_texts(documents)
-            if timing_collector:
-                timing_collector.add_duration("embedding_time", time.perf_counter() - embedding_started)
-
+        total_batches = math.ceil(total_chunks / batch_size)
+        for batch_index in range(0, total_chunks, batch_size):
+            batch = vector_chunks[batch_index:batch_index + batch_size]
+            batch_embeddings = embeddings[batch_index:batch_index + batch_size]
             db_insert_started = time.perf_counter()
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+            collection.upsert(
+                ids=[item["id"] for item in batch],
+                documents=[item["text"] for item in batch],
+                metadatas=[item["metadata"] for item in batch],
+                embeddings=batch_embeddings,
+            )
+            elapsed = time.perf_counter() - db_insert_started
+            log.info(
+                "[VECTORIZE] pdf=%s db batch %s/%s size=%s took %.3fs",
+                pdf_id,
+                (batch_index // batch_size) + 1,
+                total_batches,
+                len(batch),
+                elapsed,
+            )
             if timing_collector:
-                timing_collector.add_duration("vector_db_insert_time", time.perf_counter() - db_insert_started)
+                timing_collector.add_duration("vector_db_insert_time", elapsed)
     return collection
 
 def load_collection_pages(pdf_id: str) -> list[dict]:
@@ -3030,4 +3137,12 @@ async def startup():
     log.info(f"Vision model : {LOCAL_VISION_MODEL}")
     log.info(f"Text model   : {LOCAL_TEXT_MODEL}")
     log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
+    log.info(
+        "Embedding config: model=%s preferred_device=%s embedding_batch_size=%s db_batch_size=%s",
+        EMBEDDING_MODEL_NAME,
+        resolve_embedding_device(),
+        EMBEDDING_BATCH_SIZE,
+        VECTOR_DB_BATCH_SIZE,
+    )
+    await asyncio.to_thread(get_embedder)
     log.info("Server ready")
