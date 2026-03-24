@@ -415,6 +415,37 @@ def analyze_extracted_text(text: str) -> dict:
     }
 
 
+DEVANAGARI_DIGIT_MAP = str.maketrans("\u0966\u0967\u0968\u0969\u096A\u096B\u096C\u096D\u096E\u096F", "0123456789")
+
+
+def debug_dump(label: str, value, max_chars: int = 6000):
+    text_value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+    text_value = text_value or ""
+    clipped = text_value[:max_chars]
+    if len(text_value) > max_chars:
+        clipped += f"\n...[truncated {len(text_value) - max_chars} chars]"
+    log.info("[DEBUG DUMP] %s:\n%s", label, clipped)
+
+
+def normalize_ocr_text(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+
+
+def normalize_page_digits(text: str) -> str:
+    return (text or "").translate(DEVANAGARI_DIGIT_MAP)
+
+
+def needs_ocr(direct_text: str) -> bool:
+    stats = analyze_extracted_text(direct_text)
+    if stats["chars"] == 0:
+        return True
+    if stats["words"] >= 18 and stats["line_count"] >= 3:
+        return False
+    if stats["chars"] >= 120 and stats["line_count"] >= 2:
+        return False
+    return True
+
+
 def should_try_handwritten_assist(direct_text: str, ocr_text: str) -> bool:
     """Heuristic gate for hard scanned pages where Tesseract is likely insufficient."""
     ocr_stats = analyze_extracted_text(ocr_text)
@@ -463,24 +494,28 @@ def extract_page_content(
     """
     Extract text from a PDF page.
     First tries direct text extraction (fast, perfect for digital PDFs).
-    Falls back to OCR if the page is a scan.
+    Falls back to OCR only when the direct text looks incomplete.
     For hard handwritten/low-quality Hindi pages, optionally uses the vision model
     to improve the stored text used by indexing and chat.
     """
-    direct_text = page.get_text("text").strip()
-    if len(direct_text) > 30:
-        clean = re.sub(r"\n{3,}", "\n\n", direct_text)
+    direct_text = normalize_ocr_text(page.get_text("text"))
+    debug_dump(f"direct text page {page_num}", direct_text)
+
+    if not needs_ocr(direct_text):
+        log.info("[OCR GATE] Page %s skipped OCR and used direct text (%s chars)", page_num, len(direct_text))
         return {
-            "text": clean,
+            "text": direct_text,
             "used_ocr": False,
             "vision_used": False,
             "handwriting_suspected": False,
             "extraction_method": "digital",
         }
 
+    log.info("[OCR GATE] Page %s sent to OCR (%s chars of direct text)", page_num, len(direct_text))
     ocr_started = time.perf_counter()
     image = render_page_image(page, dpi=dpi)
-    ocr_text = ocr_page_image(image)
+    ocr_text = normalize_ocr_text(ocr_page_image(image))
+    debug_dump(f"ocr text page {page_num}", ocr_text)
     vision_used = False
     handwriting_suspected = should_try_handwritten_assist(direct_text, ocr_text)
     final_text = ocr_text
@@ -489,6 +524,7 @@ def extract_page_content(
     if handwriting_suspected:
         enhanced_text = extract_handwritten_page_text(image, page_num)
         if enhanced_text:
+            enhanced_text = normalize_ocr_text(enhanced_text)
             enhanced_stats = analyze_extracted_text(enhanced_text)
             ocr_stats = analyze_extracted_text(ocr_text)
             if enhanced_stats["chars"] >= max(ocr_stats["chars"], 80):
@@ -500,7 +536,7 @@ def extract_page_content(
         timing_collector.add_duration("ocr_time", time.perf_counter() - ocr_started)
 
     return {
-        "text": final_text,
+        "text": final_text or direct_text,
         "used_ocr": True,
         "vision_used": vision_used,
         "handwriting_suspected": handwriting_suspected,
@@ -898,6 +934,114 @@ def collect_toc_fallback_pages(all_pages: list[dict], toc_markers: list[str], ma
         if len(chosen) >= max_pages:
             break
     return sorted(chosen, key=lambda item: item["page_num"])
+
+
+def score_toc_features(features: dict) -> int:
+    return (
+        (features["marker_hits"] * 12)
+        + (features["header_hits"] * 10)
+        + (features["line_hits"] * 6)
+        + (features["numbered_row_lines"] * 5)
+        + (features["page_range_hits"] * 4)
+        + (features["short_row_like_lines"] * 3)
+        + (features["row_like_lines"] * 2)
+        + features["dotted_leaders"]
+    )
+
+
+def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]) -> list[dict]:
+    ranked = []
+    for page in candidate_pages:
+        features = analyze_toc_page_features(page.get("text", ""), toc_markers)
+        ranked.append({
+            "page": page,
+            "score": score_toc_features(features),
+            "features": features,
+        })
+    ranked.sort(key=lambda item: (-item["score"], item["page"]["page_num"]))
+    return ranked
+
+
+def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
+    lower = line.lower()
+    return any(marker in lower for marker in toc_markers) or any(
+        re.search(pattern, lower, flags=re.IGNORECASE)
+        for pattern in TOC_TABLE_HEADER_PATTERNS
+    )
+
+
+def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
+    filtered = []
+    previous_was_row = False
+    for raw_line in (text or "").splitlines():
+        line = normalize_page_digits(re.sub(r"\s+", " ", raw_line)).strip(" |\t")
+        if len(line) < 2:
+            previous_was_row = False
+            continue
+
+        keep = False
+        if is_toc_header_line(line, toc_markers):
+            keep = True
+        elif re.match(r"^\d{1,3}[\)\.\-: ]+.+?(?:\.{2,}\s*)?\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?\s*$", line):
+            keep = True
+        elif re.search(r"\.{2,}\s*\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?\s*$", line):
+            keep = True
+        elif re.search(r"\b\d{1,4}\s*[\-\u2013\u2014]\s*\d{1,4}\b", line):
+            keep = True
+        elif previous_was_row and len(line) <= 180 and not is_toc_header_line(line, toc_markers):
+            keep = True
+
+        if keep:
+            filtered.append(line)
+        previous_was_row = keep and not is_toc_header_line(line, toc_markers)
+    return filtered
+
+
+def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") -> list[dict]:
+    items = []
+    for line in lines:
+        normalized_line = normalize_page_digits(re.sub(r"\s+", " ", line)).strip()
+        if len(normalized_line) < 4:
+            continue
+        if any(re.search(pattern, normalized_line.lower(), flags=re.IGNORECASE) for pattern in TOC_TABLE_HEADER_PATTERNS):
+            continue
+
+        serial = ""
+        body = normalized_line
+        serial_match = re.match(r"^(?P<serial>\d{1,3})[\)\.\-: ]+(?P<body>.+)$", normalized_line)
+        if serial_match:
+            serial = serial_match.group("serial")
+            body = serial_match.group("body").strip()
+
+        page_match = re.search(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?\s*$", body)
+        if not page_match:
+            if items and len(body) <= 180:
+                items[-1]["title"] = f"{items[-1]['title']} {body}".strip()
+                items[-1]["displayTitle"] = items[-1]["title"]
+                items[-1]["originalTitle"] = items[-1]["title"]
+            continue
+
+        title = body[:page_match.start()].rstrip(" .:-|\t")
+        title = re.sub(r"\.{2,}$", "", title).strip()
+        if len(title) < 3:
+            continue
+
+        page_from = int(page_match.group("from"))
+        page_to = int(page_match.group("to") or page_from)
+        if page_to < page_from:
+            page_to = page_from
+
+        items.append({
+            "serialNo": serial,
+            "title": title,
+            "displayTitle": title,
+            "originalTitle": title,
+            "pageFrom": page_from,
+            "pageTo": page_to,
+            "courtFee": "",
+            "source": default_source,
+        })
+    return items
 
 
 def combine_toc_items(*groups: list[dict]) -> list[dict]:
@@ -1752,93 +1896,209 @@ async def generate_index(req: IndexRequest):
         "pages",
         "sheet",
     ]
-    def run_toc_extraction(candidate_pages: list[dict]) -> tuple[list[int], list[dict], list[dict]]:
-        toc_pages_text = ""
-        toc_page_nums = []
+    pdf_path = stored_pdf_path(req.pdf_id)
+    toc_llm_calls = 0
+
+    def read_direct_toc_text_map(candidate_pages: list[dict]) -> dict[int, str]:
+        direct_map = {page["page_num"]: "" for page in candidate_pages}
+        if not candidate_pages or not pdf_path.exists():
+            return direct_map
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as exc:
+            log.warning("Could not open stored PDF for direct TOC text parsing: %s", exc)
+            return direct_map
+
+        try:
+            for page in candidate_pages:
+                page_num = page["page_num"]
+                if 1 <= page_num <= doc.page_count:
+                    direct_map[page_num] = normalize_ocr_text(doc[page_num - 1].get_text("text"))
+        finally:
+            doc.close()
+        return direct_map
+
+    def run_toc_extraction(
+        candidate_pages: list[dict],
+        allow_image_fallback: bool = False,
+        allow_text_llm: bool = True,
+    ) -> dict:
+        nonlocal toc_llm_calls
+        result = {
+            "page_nums": [],
+            "rule_items": [],
+            "text_items": [],
+            "image_items": [],
+            "candidate_line_count": 0,
+            "ocr_pages": [],
+            "skipped_pages": [],
+        }
+        if not candidate_pages:
+            return result
+
+        direct_text_map = read_direct_toc_text_map(candidate_pages)
+        filtered_lines: list[str] = []
+
         for page in candidate_pages:
-            toc_pages_text += f"\n--- Page {page['page_num']} ---\n{page['text']}\n"
-            toc_page_nums.append(page["page_num"])
+            page_num = page["page_num"]
+            direct_text = direct_text_map.get(page_num, "")
+            selected_text = page.get("text", "") or direct_text
+            used_ocr_for_toc = needs_ocr(direct_text)
+            result["page_nums"].append(page_num)
+            if used_ocr_for_toc:
+                result["ocr_pages"].append(page_num)
+                debug_dump(f"TOC OCR text page {page_num}", selected_text)
+            else:
+                result["skipped_pages"].append(page_num)
+            debug_dump(f"TOC direct text page {page_num}", direct_text)
+            filtered_lines.extend(filter_toc_lines(selected_text, toc_markers))
 
-        toc_image_items_local = []
-        toc_text_items_local = []
-        if toc_pages_text:
-            toc_image_items_local = extract_toc_from_page_images(stored_pdf_path(req.pdf_id), toc_page_nums)
-            if toc_image_items_local:
-                log.info("TOC extracted from page images: %s items from pages %s", len(toc_image_items_local), toc_page_nums)
+        deduped_lines = []
+        seen_lines = set()
+        for line in filtered_lines:
+            key = line.lower()
+            if key in seen_lines:
+                continue
+            deduped_lines.append(line)
+            seen_lines.add(key)
+        filtered_lines = deduped_lines
+        result["candidate_line_count"] = len(filtered_lines)
 
-            toc_prompt = f"""You are reading OCR/text extracted from Indian court document pages.
-These pages may contain a real Table of Contents / Index / ???? / ???? ???? / ???????????.
-The TOC may continue across 2 or more consecutive pages.
+        log.info("TOC OCR pages for %s: used=%s skipped=%s", req.pdf_id, result["ocr_pages"], result["skipped_pages"])
+        log.info("TOC candidate line count for %s: %s", req.pdf_id, result["candidate_line_count"])
+        debug_dump("TOC filtered lines", "\n".join(filtered_lines))
 
-If the pages contain a table of contents, extract the rows exactly as written and build the final index from that TOC.
-Use both English and Hindi entries if present.
-Treat continuation pages as part of the same TOC when they keep the same row/table structure.
+        result["rule_items"] = parse_rule_based_toc_items(filtered_lines, default_source="toc")
+        if result["rule_items"]:
+            log.info("Rule-based TOC parsing found %s rows from pages %s", len(result["rule_items"]), result["page_nums"])
 
-Rules:
-- Preserve original title text exactly. Do not translate Hindi.
-- Focus on tabular document rows, not party names or case-title headers above the table.
-- Read serial numbers, page numbers, annexure values, and page ranges carefully.
-- Hindi digits should be converted to Arabic numerals in pageFrom/pageTo.
-- If a row has only one page number, set pageFrom and pageTo to the same page.
-- If a row title wraps across multiple OCR lines, merge it into the same row title.
-- Include every TOC row you can confidently read from all shown pages.
-- If these pages are not actually a TOC, return [].
+        if allow_text_llm and filtered_lines and len(result["rule_items"]) < 2:
+            toc_prompt = f"""You are reading filtered TOC candidate lines from an Indian court document.
+These lines may come from a real Table of Contents / Index spanning multiple pages.
 
-Extracted text from pages {toc_page_nums}:
-{toc_pages_text[:9000]}
+Task:
+- Decide whether these lines represent a real TOC/index table.
+- If yes, merge continuation lines into the correct row and return strict JSON only.
+- If not, return [].
+- Preserve Hindi and English exactly as written.
+- Convert Hindi digits to Arabic numerals in pageFrom/pageTo.
+- Keep courtFee empty if unavailable.
+- Do not add commentary.
+
+Candidate pages: {result['page_nums']}
+Filtered lines:
+{chr(10).join(filtered_lines[:220])}
 
 Return only valid JSON:
 [
-  {{
+  {
     "serialNo": "1",
     "title": "exact original text as found",
     "pageFrom": 1,
     "pageTo": 4,
     "courtFee": "",
     "source": "toc"
-  }}
+  }
 ]"""
-
+            debug_dump("TOC raw prompt", toc_prompt)
+            toc_llm_calls += 1
             toc_raw = call_local_text(
                 messages=[{"role": "user", "content": toc_prompt}],
-                max_tokens=3500,
+                max_tokens=2200,
             )
-            toc_text_items_local = extract_json_list(toc_raw)
-            if toc_text_items_local:
-                log.info("TOC extracted from text: %s items from pages %s", len(toc_text_items_local), toc_page_nums)
+            debug_dump("TOC raw response", toc_raw)
+            result["text_items"] = extract_json_list(toc_raw)
+            for row in result["text_items"]:
+                row.setdefault("source", "toc")
+            if result["text_items"]:
+                log.info("Merged TOC LLM call found %s rows from pages %s", len(result["text_items"]), result["page_nums"])
             elif toc_raw.strip():
-                log.info("TOC text response for pages %s was not usable JSON (%s chars)", toc_page_nums, len(toc_raw))
+                log.info("TOC text response for pages %s was not usable JSON (%s chars)", result["page_nums"], len(toc_raw))
 
-        return toc_page_nums, toc_image_items_local, toc_text_items_local
+        combined_before_image = combine_toc_items(result["rule_items"], result["text_items"])
+        if not combined_before_image and allow_image_fallback:
+            result["image_items"] = extract_toc_from_page_images(pdf_path, result["page_nums"])
+            if result["image_items"]:
+                log.info("TOC image fallback found %s rows from pages %s", len(result["image_items"]), result["page_nums"])
+
+        return result
 
     index_items = []
     toc_source = ""
     toc_range_end = total_pages if record else indexed_end
     toc_page_nums = []
+    toc_rule_items = []
     toc_image_items = []
     toc_text_items = []
 
     with timing_collector.stage("TOC detection", "toc_detection"):
-        toc_candidate_pages = collect_toc_candidate_pages(all_pages, toc_markers, max_pages=6)
-        log.info("Primary TOC candidate pages for %s: %s", req.pdf_id, [page["page_num"] for page in toc_candidate_pages])
+        toc_started = time.perf_counter()
+        primary_candidates = collect_toc_candidate_pages(all_pages, toc_markers, max_pages=6)
+        fallback_candidates = collect_toc_fallback_pages(all_pages, toc_markers, max_pages=6)
+        ranked_primary = rank_toc_candidate_pages(primary_candidates, toc_markers)
+        ranked_fallback = rank_toc_candidate_pages(fallback_candidates, toc_markers)
+        all_candidate_pages = []
+        seen_candidate_pages = set()
+        for ranked_group in (ranked_primary, ranked_fallback):
+            for item in ranked_group:
+                page_num = item["page"]["page_num"]
+                if page_num in seen_candidate_pages:
+                    continue
+                seen_candidate_pages.add(page_num)
+                all_candidate_pages.append(item)
+        log.info(
+            "TOC candidate pages for %s: %s",
+            req.pdf_id,
+            [{"page": item["page"]["page_num"], "score": item["score"]} for item in all_candidate_pages],
+        )
 
-        if toc_candidate_pages:
-            toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(toc_candidate_pages)
+        selected_pages = [item["page"] for item in all_candidate_pages[:3]]
+        fallback_selected_pages = [item["page"] for item in ranked_fallback[:3]]
+        fallback_page_nums = [page["page_num"] for page in fallback_selected_pages]
 
-        combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
-        if not combined_toc_items:
-            fallback_toc_pages = collect_toc_fallback_pages(all_pages, toc_markers, max_pages=6)
-            fallback_page_nums = [page["page_num"] for page in fallback_toc_pages]
-            if fallback_page_nums and fallback_page_nums != toc_page_nums:
-                log.info("Retrying TOC extraction with fallback pages for %s: %s", req.pdf_id, fallback_page_nums)
-                toc_page_nums, toc_image_items, toc_text_items = run_toc_extraction(fallback_toc_pages)
-                combined_toc_items = combine_toc_items(toc_image_items, toc_text_items)
+        first_text_pages = selected_pages or fallback_selected_pages
+        first_pass = run_toc_extraction(first_text_pages, allow_image_fallback=False, allow_text_llm=True)
+        toc_page_nums = first_pass["page_nums"]
+        toc_rule_items = first_pass["rule_items"]
+        toc_text_items = first_pass["text_items"]
+        toc_image_items = first_pass["image_items"]
+        combined_toc_items = combine_toc_items(toc_rule_items, toc_text_items, toc_image_items)
+        candidate_line_count = first_pass["candidate_line_count"]
+
+        image_fallback_pages = []
+        if fallback_selected_pages and fallback_page_nums != toc_page_nums:
+            image_fallback_pages = fallback_selected_pages
+        elif selected_pages:
+            image_fallback_pages = selected_pages
+
+        if not combined_toc_items and image_fallback_pages:
+            log.info("Retrying TOC extraction with image fallback pages for %s: %s", req.pdf_id, [page["page_num"] for page in image_fallback_pages])
+            image_pass = run_toc_extraction(image_fallback_pages, allow_image_fallback=True, allow_text_llm=False)
+            toc_page_nums = image_pass["page_nums"]
+            toc_rule_items = image_pass["rule_items"]
+            toc_text_items = image_pass["text_items"]
+            toc_image_items = image_pass["image_items"]
+            combined_toc_items = combine_toc_items(toc_rule_items, toc_text_items, toc_image_items)
+            candidate_line_count = image_pass["candidate_line_count"]
+
         if combined_toc_items:
             index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc")
-            toc_source = "toc-image" if toc_image_items and not toc_text_items else "toc"
+            toc_source = "toc-image" if toc_image_items and not (toc_rule_items or toc_text_items) else "toc"
             log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
+            debug_dump("TOC final rows", index_items)
+
+        toc_elapsed = time.perf_counter() - toc_started
+        log.info(
+            "TOC detection stats for %s: candidate_line_count=%s toc_llm_calls=%s toc_detection_time=%.3fs",
+            req.pdf_id,
+            candidate_line_count,
+            toc_llm_calls,
+            toc_elapsed,
+        )
 
     with timing_collector.stage("LLM indexing", "llm_indexing_time"):
+
         scan_chunk = 25
         auto_items = []
         uncovered_pages = all_pages if not index_items else []
