@@ -823,19 +823,17 @@ def lexical_overlap_score(question: str, page_text: str) -> float:
     return overlap + density_bonus + phrase_bonus
 
 
-def normalize_index_items(items: list[dict], indexed_start: int, indexed_end: int, default_source: str) -> list[dict]:
-    normalized = []
+def parse_raw_index_items(items: list[dict], default_source: str) -> list[dict]:
+    parsed = []
     for item in items:
-        pf = coerce_page_number(item.get("pageFrom"), indexed_start)
+        pf = coerce_page_number(item.get("pageFrom"), 1)
         pt = coerce_page_number(item.get("pageTo"), pf)
         if pt < pf:
             pt = pf
-        pf = max(indexed_start, min(pf, indexed_end))
-        pt = max(pf, min(pt, indexed_end))
         title = str(item.get("title", "")).strip()
         if not title:
             continue
-        normalized.append({
+        parsed.append({
             "title": title,
             "displayTitle": str(item.get("displayTitle") or item.get("originalTitle") or title).strip(),
             "originalTitle": str(item.get("originalTitle") or title).strip(),
@@ -844,6 +842,109 @@ def normalize_index_items(items: list[dict], indexed_start: int, indexed_end: in
             "source": item.get("source", default_source),
             "serialNo": str(item.get("serialNo", "")),
             "courtFee": str(item.get("courtFee", "")),
+        })
+    return parsed
+
+
+def is_toc_anchor_title(raw_title: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", (raw_title or "").lower())
+    return normalized in {"index", "tableofcontents", "contents", "listofdocuments"}
+
+
+def infer_toc_page_offset(raw_items: list[dict], toc_page_nums: list[int], indexed_start: int, range_end: int) -> tuple[int, str]:
+    if not raw_items:
+        return 0, "no-items"
+
+    primary_toc_page = min([page_num for page_num in toc_page_nums if isinstance(page_num, int)], default=indexed_start)
+    structural_offsets = []
+    for item in raw_items:
+        page_from = item["pageFrom"]
+        if page_from < 1:
+            continue
+        if is_toc_anchor_title(item["title"]):
+            structural_offsets.append(primary_toc_page - page_from)
+
+    min_raw_page = min(item["pageFrom"] for item in raw_items)
+    candidate_offsets = [0]
+    candidate_offsets.extend(offset for offset in structural_offsets if offset > 0)
+    if indexed_start > 1 and min_raw_page >= 1:
+        heuristic_offset = indexed_start - min_raw_page
+        if heuristic_offset > 0:
+            candidate_offsets.append(heuristic_offset)
+
+    best_offset = 0
+    best_reason = "absolute"
+    best_score = float("-inf")
+
+    for offset in dict.fromkeys(candidate_offsets):
+        mapped_pages = []
+        valid = True
+        for item in raw_items:
+            mapped_from = item["pageFrom"] + offset
+            mapped_to = item["pageTo"] + offset
+            if mapped_from < 1 or mapped_to < mapped_from or mapped_to > range_end:
+                valid = False
+                break
+            mapped_pages.append((mapped_from, mapped_to))
+        if not valid:
+            continue
+
+        score = 0
+        reason = "absolute"
+        if offset == 0:
+            score += 1
+        if offset in structural_offsets:
+            score += 8
+            reason = "structural-offset"
+        if indexed_start > 1 and min_raw_page < indexed_start and offset == indexed_start - min_raw_page:
+            score += 3
+            reason = "heuristic-offset" if reason == "absolute" else reason
+        if offset > 0 and min_raw_page <= 3:
+            score += 2
+        if offset > 0 and mapped_pages and min(page_from for page_from, _ in mapped_pages) >= indexed_start:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+            best_reason = reason
+
+    if best_offset == 0:
+        return 0, best_reason
+    if best_reason == "absolute":
+        return 0, "absolute"
+    return best_offset, best_reason
+
+
+def normalize_index_items(
+    items: list[dict],
+    indexed_start: int,
+    indexed_end: int,
+    default_source: str,
+    toc_page_nums: Optional[list[int]] = None,
+) -> list[dict]:
+    raw_items = parse_raw_index_items(items, default_source)
+    inferred_offset, offset_reason = infer_toc_page_offset(raw_items, toc_page_nums or [], indexed_start, indexed_end)
+    lower_bound = 1 if inferred_offset > 0 else indexed_start
+    if inferred_offset > 0:
+        log.info(
+            "Applying TOC page offset=%s for TOC pages=%s indexed_start=%s reason=%s",
+            inferred_offset,
+            toc_page_nums or [],
+            indexed_start,
+            offset_reason,
+        )
+
+    normalized = []
+    for item in raw_items:
+        pf = item["pageFrom"] + inferred_offset
+        pt = item["pageTo"] + inferred_offset
+        pf = max(lower_bound, min(pf, indexed_end))
+        pt = max(pf, min(pt, indexed_end))
+        normalized.append({
+            **item,
+            "pageFrom": pf,
+            "pageTo": pt,
         })
 
     normalized.sort(key=lambda x: (x["pageFrom"], x["pageTo"], x["title"]))
@@ -859,8 +960,14 @@ def normalize_index_items(items: list[dict], indexed_start: int, indexed_end: in
     return deduped
 
 
-def build_toc_ranges_from_items(items: list[dict], indexed_start: int, range_end: int, default_source: str) -> list[dict]:
-    normalized = normalize_index_items(items, indexed_start, range_end, default_source)
+def build_toc_ranges_from_items(
+    items: list[dict],
+    indexed_start: int,
+    range_end: int,
+    default_source: str,
+    toc_page_nums: Optional[list[int]] = None,
+) -> list[dict]:
+    normalized = normalize_index_items(items, indexed_start, range_end, default_source, toc_page_nums=toc_page_nums)
     if not normalized:
         return []
 
@@ -2483,7 +2590,7 @@ Return only valid JSON:
             candidate_line_count = image_pass["candidate_line_count"]
 
         if combined_toc_items:
-            index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc")
+            index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc", toc_page_nums=toc_page_nums)
             toc_source = toc_source or ("toc-image" if toc_image_items and not (toc_rule_items or toc_text_items) else "toc")
             log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
             debug_dump("TOC final rows", index_items)
