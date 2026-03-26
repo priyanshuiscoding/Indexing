@@ -3,6 +3,7 @@ import "./App.css";
 import { documentCatalog } from "./documentCatalog";
 
 const API = process.env.REACT_APP_API_BASE || "";
+const SAVED_PDF_MEMORY_CACHE_LIMIT = 8;
 
 const getFetchErrorMessage = (err) => {
   if (err instanceof TypeError && /fetch/i.test(err.message)) {
@@ -780,6 +781,7 @@ export default function App() {
   const handledIndexRunnerRef = useRef("");
   const indexSectionRef = useRef(null);
   const indexSpotlightTimeoutRef = useRef(null);
+  const pdfCacheRef = useRef(new Map());
 
   const rebuildCoverage = useCallback((items, total) => {
     const cmap = {};
@@ -800,6 +802,14 @@ export default function App() {
     if (indexSpotlightTimeoutRef.current) {
       window.clearTimeout(indexSpotlightTimeoutRef.current);
     }
+    Array.from(pdfCacheRef.current.values()).forEach((entry) => {
+      if (entry?.objectUrl) {
+        try {
+          URL.revokeObjectURL(entry.objectUrl);
+        } catch (_) {}
+      }
+    });
+    pdfCacheRef.current.clear();
   }, []);
 
   const handlePageVisible = useCallback((page) => setCurrentPage(page), []);
@@ -810,6 +820,56 @@ export default function App() {
     document.getElementById(`pg-${page}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
     if (secIdx !== null) setActiveIdx(secIdx);
   };
+
+  const touchCachedPdf = useCallback((targetPdfId) => {
+    const cache = pdfCacheRef.current;
+    const cached = cache.get(targetPdfId);
+    if (!cached) return null;
+    cache.delete(targetPdfId);
+    cached.lastUsedAt = Date.now();
+    cache.set(targetPdfId, cached);
+    return cached;
+  }, []);
+
+  const storeCachedPdf = useCallback((targetPdfId, payload) => {
+    const cache = pdfCacheRef.current;
+    if (cache.has(targetPdfId)) {
+      const previous = cache.get(targetPdfId);
+      if (previous?.objectUrl && previous.objectUrl !== payload.objectUrl) {
+        try {
+          URL.revokeObjectURL(previous.objectUrl);
+        } catch (_) {}
+      }
+      cache.delete(targetPdfId);
+    }
+
+    cache.set(targetPdfId, {
+      ...payload,
+      lastUsedAt: Date.now(),
+    });
+
+    while (cache.size > SAVED_PDF_MEMORY_CACHE_LIMIT) {
+      const oldestKey = cache.keys().next().value;
+      const oldest = cache.get(oldestKey);
+      if (oldest?.objectUrl) {
+        try {
+          URL.revokeObjectURL(oldest.objectUrl);
+        } catch (_) {}
+      }
+      cache.delete(oldestKey);
+    }
+  }, []);
+
+  const removeCachedPdf = useCallback((targetPdfId) => {
+    const cache = pdfCacheRef.current;
+    const cached = cache.get(targetPdfId);
+    if (cached?.objectUrl) {
+      try {
+        URL.revokeObjectURL(cached.objectUrl);
+      } catch (_) {}
+    }
+    cache.delete(targetPdfId);
+  }, []);
 
   const persistSections = async (nextSections) => {
     if (!pdfId) return nextSections;
@@ -886,17 +946,31 @@ export default function App() {
     if (!targetPdfId) return;
     setError("");
     setLoading(true);
-    setLoadingStep("Loading saved PDF from backend...");
+    const cached = touchCachedPdf(targetPdfId);
+    setLoadingStep(cached ? "Opening saved PDF from memory cache..." : "Loading saved PDF from backend...");
     try {
-      const [details, blob, pdfjsLib] = await Promise.all([
-        apiFetch(`/api/pdfs/${targetPdfId}`),
-        apiFetchBlob(`/api/pdfs/${targetPdfId}/file`),
-        loadPdfJs(),
-      ]);
-      const objectUrl = URL.createObjectURL(blob);
-      const arrayBuf = await blob.arrayBuffer();
-      const doc = await pdfjsLib.getDocument({ data: arrayBuf.slice(0) }).promise;
-      const pdf = details.pdf || {};
+      let details = cached?.details;
+      let objectUrl = cached?.objectUrl;
+      let doc = cached?.pdfDoc;
+
+      if (!cached) {
+        const [fetchedDetails, blob, pdfjsLib] = await Promise.all([
+          apiFetch(`/api/pdfs/${targetPdfId}`),
+          apiFetchBlob(`/api/pdfs/${targetPdfId}/file`),
+          loadPdfJs(),
+        ]);
+        details = fetchedDetails;
+        objectUrl = URL.createObjectURL(blob);
+        const arrayBuf = await blob.arrayBuffer();
+        doc = await pdfjsLib.getDocument({ data: arrayBuf.slice(0) }).promise;
+        storeCachedPdf(targetPdfId, {
+          details,
+          objectUrl,
+          pdfDoc: doc,
+        });
+      }
+
+      const pdf = details?.pdf || {};
       const nextCaseInfo = deriveDocumentMeta(pdf.filename || targetPdfId);
       resetDocumentState(nextCaseInfo);
       setPdfDoc(doc);
@@ -916,7 +990,7 @@ export default function App() {
         end: pdf.selected_end_page || Math.min(doc.numPages, 10),
         count: pdf.indexed_pages || 0,
       });
-      const normalized = normalizeSections(details.index || [], nextCaseInfo.batchNo || "");
+      const normalized = normalizeSections(details?.index || [], nextCaseInfo.batchNo || "");
       setSections(normalized);
       rebuildCoverage(normalized, pdf.total_pages || doc.numPages);
     } catch (err) {
@@ -926,7 +1000,7 @@ export default function App() {
       setLoading(false);
       setLoadingStep("");
     }
-  }, [rebuildCoverage]);
+  }, [rebuildCoverage, storeCachedPdf, touchCachedPdf]);
 
   const spotlightIndexSection = useCallback(() => {
     if (indexSpotlightTimeoutRef.current) {
@@ -1237,6 +1311,7 @@ export default function App() {
     setLoadingStep(`Deleting ${item.filename || item.pdf_id} from backend...`);
     try {
       await apiFetch(`/api/pdfs/${item.pdf_id}`, { method: "DELETE" });
+      removeCachedPdf(item.pdf_id);
       if (selectedSavedPdfId === item.pdf_id || pdfId === item.pdf_id) {
         if (pdfFile?.objectUrl) {
           try {
