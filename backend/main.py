@@ -2178,6 +2178,10 @@ class TextTransformRequest(BaseModel):
     action: str
 
 
+class IndexSaveRequest(BaseModel):
+    index: list[dict]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3198,6 +3202,58 @@ async def get_pdf_details(pdf_id: str):
     return {
         "pdf": record,
         "index": get_saved_index(pdf_id),
+    }
+
+
+@app.post("/api/pdfs/{pdf_id}/index")
+async def save_pdf_index(pdf_id: str, req: IndexSaveRequest):
+    record = get_pdf_record(pdf_id)
+    if not record:
+        raise HTTPException(404, f"PDF {pdf_id} not found")
+
+    normalized_items = []
+    total_pages = max(1, int(record.get("total_pages") or 1))
+
+    for raw_item in req.index or []:
+        page_from = max(1, min(coerce_page_number(raw_item.get("pageFrom"), 1), total_pages))
+        page_to = max(page_from, min(coerce_page_number(raw_item.get("pageTo"), page_from), total_pages))
+        pdf_page_from = max(1, min(coerce_page_number(raw_item.get("pdfPageFrom"), page_from), total_pages))
+        pdf_page_to = max(pdf_page_from, min(coerce_page_number(raw_item.get("pdfPageTo"), page_to), total_pages))
+
+        normalized_items.append({
+            **raw_item,
+            "title": str(raw_item.get("title") or "").strip(),
+            "displayTitle": str(raw_item.get("displayTitle") or raw_item.get("originalTitle") or raw_item.get("title") or "").strip(),
+            "originalTitle": str(raw_item.get("originalTitle") or raw_item.get("displayTitle") or raw_item.get("title") or "").strip(),
+            "pageFrom": page_from,
+            "pageTo": page_to,
+            "pdfPageFrom": pdf_page_from,
+            "pdfPageTo": pdf_page_to,
+            "source": raw_item.get("source", "manual"),
+            "serialNo": str(raw_item.get("serialNo", "")),
+            "courtFee": str(raw_item.get("courtFee", "")),
+        })
+
+    normalized_items.sort(key=lambda item: (item.get("pageFrom", 0), item.get("pageTo", 0), item.get("title", "")))
+    save_index(pdf_id, normalized_items)
+    update_pdf_record(pdf_id, index_ready=True, index_source="manual")
+
+    export_path = export_index_json(
+        pdf_id=pdf_id,
+        record=get_pdf_record(pdf_id),
+        index_items=normalized_items,
+        indexed_start=int(record.get("selected_start_page") or 1),
+        indexed_end=int(record.get("selected_end_page") or total_pages),
+        total_pages=total_pages,
+        index_source="manual",
+    )
+
+    return {
+        "pdf_id": pdf_id,
+        "index": normalized_items,
+        "index_entries": len(normalized_items),
+        "index_source": "manual",
+        "export_path": str(export_path),
     }
 
 

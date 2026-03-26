@@ -690,27 +690,55 @@ export default function App() {
     if (secIdx !== null) setActiveIdx(secIdx);
   };
 
-  const handleSaveEdit = (updated) => {
+  const persistSections = async (nextSections) => {
+    if (!pdfId) return nextSections;
+    const resp = await apiFetch(`/api/pdfs/${pdfId}/index`, {
+      method: "POST",
+      body: JSON.stringify({ index: nextSections }),
+    });
+    return normalizeSections(resp.index || nextSections, caseInfo?.batchNo || "");
+  };
+
+  const handleSaveEdit = async (updated) => {
+    const normalizedUpdated = applyCatalogClassification({
+      ...updated,
+      pdfPageFrom: updated.pageFrom,
+      pdfPageTo: updated.pageTo,
+      tocPageFrom: "",
+      tocPageTo: "",
+    });
     const next = sections
-      .map((section, idx) => (idx === editingIdx ? applyCatalogClassification(updated) : section))
+      .map((section, idx) => (idx === editingIdx ? normalizedUpdated : section))
       .sort((a, b) => a.pageFrom - b.pageFrom);
-    setSections(next);
-    rebuildCoverage(next, totalPages);
+    const persisted = await persistSections(next);
+    setSections(persisted);
+    rebuildCoverage(persisted, totalPages);
     setEditingIdx(null);
   };
 
-  const handleDelete = (idx) => {
+  const handleDelete = async (idx) => {
     const next = sections.filter((_, sectionIdx) => sectionIdx !== idx);
-    setSections(next);
-    rebuildCoverage(next, totalPages);
+    const persisted = await persistSections(next);
+    setSections(persisted);
+    rebuildCoverage(persisted, totalPages);
     setConfirmIdx(null);
     if (activeIdx === idx) setActiveIdx(null);
   };
 
-  const handleAdd = (newSection) => {
-    const next = [...sections, applyCatalogClassification(newSection)].sort((a, b) => a.pageFrom - b.pageFrom);
-    setSections(next);
-    rebuildCoverage(next, totalPages);
+  const handleAdd = async (newSection) => {
+    const next = [
+      ...sections,
+      applyCatalogClassification({
+        ...newSection,
+        pdfPageFrom: newSection.pageFrom,
+        pdfPageTo: newSection.pageTo,
+        tocPageFrom: "",
+        tocPageTo: "",
+      }),
+    ].sort((a, b) => a.pageFrom - b.pageFrom);
+    const persisted = await persistSections(next);
+    setSections(persisted);
+    rebuildCoverage(persisted, totalPages);
   };
 
   const applyBatchSearch = () => setBatchFilter(batchSearch.trim());
