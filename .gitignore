@@ -1,0 +1,26 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/.hf_cache/
+backend/.mypy_cache/
+backend/.pytest_cache/
+backend/*.pyc
+backend/workflow.db
+
+# Secrets
+backend/.env
+
+# Frontend
+frontend/node_modules/
+frontend/build/
+
+# Runtime data
+chroma_db/
+stored_pdfs/
+backend/chroma_db/
+backend/stored_pdfs/
+backend/index_exports/
+
+# OS / misc
+.DS_Store
+Thumbs.db

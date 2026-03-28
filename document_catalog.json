@@ -1,0 +1,286 @@
+[
+  {
+    "code": "1",
+    "name": "Process Fee"
+  },
+  {
+    "code": "2",
+    "name": "Vakalat Nama"
+  },
+  {
+    "code": "4",
+    "name": "Reply"
+  },
+  {
+    "code": "5",
+    "name": "Written Statement"
+  },
+  {
+    "code": "6",
+    "name": "Replication"
+  },
+  {
+    "code": "7",
+    "name": "Rejoinder"
+  },
+  {
+    "code": "8",
+    "name": "Affidavit"
+  },
+  {
+    "code": "9",
+    "name": "Power of Attorney"
+  },
+  {
+    "code": "10",
+    "name": "Counter Affadavit"
+  },
+  {
+    "code": "11",
+    "name": "Fresh Process fee"
+  },
+  {
+    "code": "12",
+    "name": "Fresh Address"
+  },
+  {
+    "code": "13",
+    "name": "Other"
+  },
+  {
+    "code": "14",
+    "name": "LCR"
+  },
+  {
+    "code": "15",
+    "name": "PUC"
+  },
+  {
+    "code": "16",
+    "name": "Letter"
+  },
+  {
+    "code": "17",
+    "name": "Notices"
+  },
+  {
+    "code": "18",
+    "name": "Reports"
+  },
+  {
+    "code": "19",
+    "name": "Paper Book"
+  },
+  {
+    "code": "20",
+    "name": "Mediation Report"
+  },
+  {
+    "code": "21",
+    "name": "Office-Copy"
+  },
+  {
+    "code": "22",
+    "name": "Letter To Counsel"
+  },
+  {
+    "code": "23",
+    "name": "Interlocutary Application"
+  },
+  {
+    "code": "25",
+    "name": "Mentioning Slip"
+  },
+  {
+    "code": "26",
+    "name": "Urgent Form"
+  },
+  {
+    "code": "27",
+    "name": "Index"
+  },
+  {
+    "code": "28",
+    "name": "Advance Copy Acknowledgement"
+  },
+  {
+    "code": "29",
+    "name": "Certificate/Undertaking"
+  },
+  {
+    "code": "30",
+    "name": "e-Court Fee/Stamp Paper"
+  },
+  {
+    "code": "31",
+    "name": "Brief Synopsis"
+  },
+  {
+    "code": "32",
+    "name": "List of Dates & Events"
+  },
+  {
+    "code": "33",
+    "name": "Openinig Sheet"
+  },
+  {
+    "code": "34",
+    "name": "Grounds of Appeal"
+  },
+  {
+    "code": "35",
+    "name": "Grounds of Revision"
+  },
+  {
+    "code": "36",
+    "name": "Memo of Parties"
+  },
+  {
+    "code": "37",
+    "name": "Anticipatory Bail"
+  },
+  {
+    "code": "38",
+    "name": "Regular Bail"
+  },
+  {
+    "code": "39",
+    "name": "Cancellation of Bail"
+  },
+  {
+    "code": "40",
+    "name": "Interim Bail"
+  },
+  {
+    "code": "41",
+    "name": "Revision"
+  },
+  {
+    "code": "42",
+    "name": "Petition"
+  },
+  {
+    "code": "43",
+    "name": "First Appeal"
+  },
+  {
+    "code": "44",
+    "name": "Second Appeal"
+  },
+  {
+    "code": "45",
+    "name": "Appeal against Conviction"
+  },
+  {
+    "code": "46",
+    "name": "Appeal against Acquittal"
+  },
+  {
+    "code": "47",
+    "name": "Leave to Appeal"
+  },
+  {
+    "code": "48",
+    "name": "Murder Reference"
+  },
+  {
+    "code": "49",
+    "name": "Writ Petition"
+  },
+  {
+    "code": "50",
+    "name": "Writ - Public Interest Litigation"
+  },
+  {
+    "code": "51",
+    "name": "Impugned Order"
+  },
+  {
+    "code": "52",
+    "name": "Annexure"
+  },
+  {
+    "code": "53",
+    "name": "Affidavit"
+  },
+  {
+    "code": "54",
+    "name": "Power of Attorney/Vakalatnama"
+  },
+  {
+    "code": "55",
+    "name": "GPA/SPA/Resolution/Authority Letter/LR instructions"
+  },
+  {
+    "code": "56",
+    "name": "Identity Proof"
+  },
+  {
+    "code": "57",
+    "name": "Vernaculars"
+  },
+  {
+    "code": "58",
+    "name": "Office Liquidator Report"
+  },
+  {
+    "code": "59",
+    "name": "Application"
+  },
+  {
+    "code": "60",
+    "name": "Cross Objection"
+  },
+  {
+    "code": "61",
+    "name": "Memo of Appearance"
+  },
+  {
+    "code": "62",
+    "name": "LOWER COURT RECORD"
+  },
+  {
+    "code": "63",
+    "name": "Reply"
+  },
+  {
+    "code": "64",
+    "name": "Affidavit"
+  },
+  {
+    "code": "65",
+    "name": "IOIN"
+  },
+  {
+    "code": "66",
+    "name": "Written Statement"
+  },
+  {
+    "code": "67",
+    "name": "Rejoinder"
+  },
+  {
+    "code": "68",
+    "name": "Replication"
+  },
+  {
+    "code": "69",
+    "name": "Administrative Orders"
+  },
+  {
+    "code": "70",
+    "name": "Office Note"
+  },
+  {
+    "code": "71",
+    "name": "Others"
+  },
+  {
+    "code": "72",
+    "name": "FINAL ORDER"
+  },
+  {
+    "code": "73",
+    "name": "qwertyu"
+  }
+]
