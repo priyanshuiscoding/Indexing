@@ -227,7 +227,7 @@ body { font-family: 'DM Sans', system-ui, sans-serif; background: linear-gradien
 .add-input { border: 1px solid #d1d5db; border-radius: 5px; padding: 6px 10px; font-size: 13px; color: #374151; outline: none; background: #fff; width: 200px; transition: border-color 0.15s; }
 .add-input.full { width: 100%; flex: 1; }
 .add-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.15); }
-.add-pages-row { display: flex; gap: 14px; margin-top: 6px; flex-wrap: wrap; }
+.add-pages-row { display: grid; grid-template-columns: repeat(6, minmax(96px, 1fr)); gap: 14px; margin-top: 6px; }
 .add-page-field { display: flex; flex-direction: column; gap: 4px; }
 .add-page-label { font-size: 11px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.6px; }
 .add-page-input { border: 1px solid #d1d5db; border-radius: 5px; padding: 6px 10px; font-size: 13px; color: #374151; outline: none; background: #fff; width: 110px; transition: border-color 0.15s; }
@@ -250,7 +250,7 @@ body { font-family: 'DM Sans', system-ui, sans-serif; background: linear-gradien
 .col-num { width: 44px; text-align: center; color: #9ca3af; font-weight: 600; }
 .col-doc { min-width: 200px; }
 .col-batch { width: 140px; }
-.col-page { width: 90px; text-align: center; font-family: 'DM Mono', monospace; font-size: 12px; color: #374151; }
+.col-page { width: 78px; text-align: center; font-family: 'DM Mono', monospace; font-size: 12px; color: #374151; }
 .col-action { width: 56px; text-align: center; }
 .doc-cell { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .doc-name { color: #1d4ed8; font-weight: 500; }
@@ -277,7 +277,7 @@ body { font-family: 'DM Sans', system-ui, sans-serif; background: linear-gradien
 .form-grid { display: flex; flex-direction: column; gap: 10px; }
 .form-row { display: flex; align-items: center; gap: 14px; flex: 1; }
 .form-row-full { display: flex; align-items: center; gap: 14px; }
-.form-row-pages { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.form-row-pages { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 14px; align-items: flex-end; }
 .form-label { font-size: 13px; font-weight: 600; color: #374151; min-width: 100px; flex-shrink: 0; }
 .form-input { flex: 1; border: 1px solid #d1d5db; border-radius: 5px; padding: 6px 10px; font-size: 13px; color: #374151; outline: none; background: #fff; font-family: inherit; min-width: 0; transition: border-color 0.15s; }
 .form-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.15); }

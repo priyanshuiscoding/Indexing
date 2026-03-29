@@ -734,14 +734,26 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
   const [subDoc, setSubDoc] = useState(section.subDocument || "");
   const [note, setNote] = useState(section.note || "");
   const [batchNo, setBatchNo] = useState(section.batchNo || "");
-  const [pageFrom, setPageFrom] = useState(section.pageFrom || 1);
-  const [pageTo, setPageTo] = useState(section.pageTo || 1);
+  const [tocPageFrom, setTocPageFrom] = useState(section.tocPageFrom || "");
+  const [tocPageTo, setTocPageTo] = useState(section.tocPageTo || "");
+  const [pdfPageFrom, setPdfPageFrom] = useState(section.pdfPageFrom || section.pageFrom || 1);
+  const [pdfPageTo, setPdfPageTo] = useState(section.pdfPageTo || section.pageTo || 1);
   const [recDate, setRecDate] = useState(section.receivingDate || "");
 
   const save = () => {
     if (!title.trim()) return;
-    const pf = Math.max(1, Math.min(parseInt(pageFrom, 10) || 1, totalPages));
-    const pt = Math.max(pf, Math.min(parseInt(pageTo, 10) || pf, totalPages));
+    const rawTocFrom = parseInt(tocPageFrom, 10);
+    const rawTocTo = parseInt(tocPageTo, 10);
+    const rawPdfFrom = parseInt(pdfPageFrom, 10);
+    const rawPdfTo = parseInt(pdfPageTo, 10);
+
+    const normalizedTocFrom = Number.isFinite(rawTocFrom) ? Math.max(1, Math.min(rawTocFrom, totalPages)) : "";
+    const normalizedTocTo = Number.isFinite(rawTocTo)
+      ? Math.max(Number.isFinite(normalizedTocFrom) ? normalizedTocFrom : 1, Math.min(rawTocTo, totalPages))
+      : (normalizedTocFrom || "");
+
+    const resolvedPdfFrom = Math.max(1, Math.min(rawPdfFrom || normalizedTocFrom || section.pageFrom || 1, totalPages));
+    const resolvedPdfTo = Math.max(resolvedPdfFrom, Math.min(rawPdfTo || normalizedTocTo || resolvedPdfFrom, totalPages));
     const normalizedSubDoc = subDoc.trim() || "null";
     onSave({
       ...section,
@@ -749,8 +761,12 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
       subDocument: normalizedSubDoc,
       note: note.trim(),
       batchNo: batchNo.trim(),
-      pageFrom: pf,
-      pageTo: pt,
+      pageFrom: resolvedPdfFrom,
+      pageTo: resolvedPdfTo,
+      pdfPageFrom: resolvedPdfFrom,
+      pdfPageTo: resolvedPdfTo,
+      tocPageFrom: normalizedTocFrom,
+      tocPageTo: normalizedTocTo,
       receivingDate: recDate,
       source: section.source === "gap" ? "manual" : section.source,
     });
@@ -758,7 +774,7 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
 
   return (
     <tr className="inline-edit-row">
-      <td colSpan={7} style={{ padding: 0 }}>
+      <td colSpan={9} style={{ padding: 0 }}>
         <div className="inline-edit-panel">
           <div className="inline-edit-header">
             <span>Edit Entry</span>
@@ -789,12 +805,20 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
             </div>
             <div className="form-row-pages">
               <div>
-                <label className="form-label">From Page</label>
-                <input type="number" className="form-input" min={1} max={totalPages} value={pageFrom} onChange={(e) => setPageFrom(e.target.value)} />
+                <label className="form-label">From TOC</label>
+                <input type="number" className="form-input" min={1} max={totalPages} value={tocPageFrom} onChange={(e) => setTocPageFrom(e.target.value)} placeholder="Optional" />
               </div>
               <div>
-                <label className="form-label">To Page</label>
-                <input type="number" className="form-input" min={1} max={totalPages} value={pageTo} onChange={(e) => setPageTo(e.target.value)} />
+                <label className="form-label">To TOC</label>
+                <input type="number" className="form-input" min={1} max={totalPages} value={tocPageTo} onChange={(e) => setTocPageTo(e.target.value)} placeholder="Optional" />
+              </div>
+              <div>
+                <label className="form-label">From PDF</label>
+                <input type="number" className="form-input" min={1} max={totalPages} value={pdfPageFrom} onChange={(e) => setPdfPageFrom(e.target.value)} />
+              </div>
+              <div>
+                <label className="form-label">To PDF</label>
+                <input type="number" className="form-input" min={1} max={totalPages} value={pdfPageTo} onChange={(e) => setPdfPageTo(e.target.value)} />
               </div>
               <div>
                 <label className="form-label">Receiving Date</label>
@@ -818,16 +842,18 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
   const [customDocName, setCustomDocName] = useState("");
   const [note, setNote] = useState("");
   const [batchNo, setBatchNo] = useState(defaultBatchNo || "");
-  const [pageFrom, setPageFrom] = useState("");
-  const [pageTo, setPageTo] = useState("");
+  const [tocPageFrom, setTocPageFrom] = useState("");
+  const [tocPageTo, setTocPageTo] = useState("");
+  const [pdfPageFrom, setPdfPageFrom] = useState("");
+  const [pdfPageTo, setPdfPageTo] = useState("");
   const [recDate, setRecDate] = useState("");
   const [total, setTotal] = useState("");
 
   useEffect(() => {
-    const pf = parseInt(pageFrom, 10);
-    const pt = parseInt(pageTo, 10);
-    if (pf && pt && pt >= pf) setTotal(String(pt - pf + 1));
-  }, [pageFrom, pageTo]);
+    const preferredFrom = parseInt(pdfPageFrom, 10) || parseInt(tocPageFrom, 10);
+    const preferredTo = parseInt(pdfPageTo, 10) || parseInt(tocPageTo, 10);
+    if (preferredFrom && preferredTo && preferredTo >= preferredFrom) setTotal(String(preferredTo - preferredFrom + 1));
+  }, [pdfPageFrom, pdfPageTo, tocPageFrom, tocPageTo]);
 
   useEffect(() => {
     setBatchNo(defaultBatchNo || "");
@@ -842,16 +868,31 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
   const save = () => {
     const title = doc === "Other" ? customDocName.trim() : doc.trim();
     if (!title) return;
-    const pf = Math.max(1, Math.min(parseInt(pageFrom, 10) || 1, totalPages));
-    const pt = Math.max(pf, Math.min(parseInt(pageTo, 10) || pf, totalPages));
+    const rawTocFrom = parseInt(tocPageFrom, 10);
+    const rawTocTo = parseInt(tocPageTo, 10);
+    const rawPdfFrom = parseInt(pdfPageFrom, 10);
+    const rawPdfTo = parseInt(pdfPageTo, 10);
+
+    const normalizedTocFrom = Number.isFinite(rawTocFrom) ? Math.max(1, Math.min(rawTocFrom, totalPages)) : "";
+    const normalizedTocTo = Number.isFinite(rawTocTo)
+      ? Math.max(Number.isFinite(normalizedTocFrom) ? normalizedTocFrom : 1, Math.min(rawTocTo, totalPages))
+      : (normalizedTocFrom || "");
+
+    const resolvedPdfFrom = Math.max(1, Math.min(rawPdfFrom || normalizedTocFrom || 1, totalPages));
+    const resolvedPdfTo = Math.max(resolvedPdfFrom, Math.min(rawPdfTo || normalizedTocTo || resolvedPdfFrom, totalPages));
+
     onAdd({
       title,
       subDocument: subDoc.trim() || "null",
       note: note.trim(),
       batchNo: batchNo.trim(),
-      pageFrom: pf,
-      pageTo: pt,
-      totalPage: parseInt(total, 10) || (pt - pf + 1),
+      pageFrom: resolvedPdfFrom,
+      pageTo: resolvedPdfTo,
+      pdfPageFrom: resolvedPdfFrom,
+      pdfPageTo: resolvedPdfTo,
+      tocPageFrom: normalizedTocFrom,
+      tocPageTo: normalizedTocTo,
+      totalPage: parseInt(total, 10) || (resolvedPdfTo - resolvedPdfFrom + 1),
       receivingDate: recDate,
       source: "manual",
     });
@@ -859,8 +900,10 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
     setSubDoc("");
     setCustomDocName("");
     setNote("");
-    setPageFrom("");
-    setPageTo("");
+    setTocPageFrom("");
+    setTocPageTo("");
+    setPdfPageFrom("");
+    setPdfPageTo("");
     setRecDate("");
     setTotal("");
   };
@@ -907,7 +950,7 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
         <input className="add-input full" value={batchNo} onChange={(e) => setBatchNo(e.target.value)} placeholder="Batch number (optional)" />
       </div>
       <div className="add-pages-row">
-        {[["From Page", pageFrom, setPageFrom], ["To Page", pageTo, setPageTo], ["Total Page", total, setTotal]].map(([label, value, setter]) => (
+        {[["From TOC", tocPageFrom, setTocPageFrom], ["To TOC", tocPageTo, setTocPageTo], ["From PDF", pdfPageFrom, setPdfPageFrom], ["To PDF", pdfPageTo, setPdfPageTo], ["Total Page", total, setTotal]].map(([label, value, setter]) => (
           <div key={label} className="add-page-field">
             <label className="add-page-label">{label}</label>
             <input type="number" className="add-page-input" value={value} onChange={(e) => setter(e.target.value)} />
@@ -2197,8 +2240,10 @@ export default function App() {
                         <th className="col-num">#</th>
                         <th className="col-doc">Document</th>
                         <th className="col-batch">Batch No.</th>
-                        <th className="col-page">From Page</th>
-                        <th className="col-page">To Page</th>
+                        <th className="col-page">From TOC</th>
+                        <th className="col-page">To TOC</th>
+                        <th className="col-page">From PDF</th>
+                        <th className="col-page">To PDF</th>
                         <th className="col-action">Update</th>
                         <th className="col-action">Delete</th>
                       </tr>
@@ -2222,8 +2267,10 @@ export default function App() {
                               </div>
                             </td>
                             <td className="col-batch"><span className="batch-pill">{sec.batchNo || "-"}</span></td>
-                            <td className="col-page">{formatPageValue(sec.tocPageFrom, sec.tocPageFrom || sec.tocPageTo, sec.pdfPageFrom || sec.pageFrom, sec.pdfPageFrom || sec.pageFrom, "TOC", "PDF")}</td>
-                            <td className="col-page">{formatPageValue(sec.tocPageTo, sec.tocPageTo || sec.tocPageFrom, sec.pdfPageTo || sec.pageTo, sec.pdfPageTo || sec.pageTo, "TOC", "PDF")}</td>
+                            <td className="col-page">{sec.tocPageFrom || "-"}</td>
+                            <td className="col-page">{sec.tocPageTo || "-"}</td>
+                            <td className="col-page">{sec.pdfPageFrom || sec.pageFrom || "-"}</td>
+                            <td className="col-page">{sec.pdfPageTo || sec.pageTo || "-"}</td>
                             <td className="col-action">
                               <button className="action-btn edit-btn" onClick={(e) => { e.stopPropagation(); setEditingIdx(editingIdx === idx ? null : idx); }}>Edit</button>
                             </td>
