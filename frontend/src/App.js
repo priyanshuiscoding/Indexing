@@ -444,6 +444,7 @@ function QueueStatusModal({
   runReviewReindexQueue,
   stopAllProcessing,
   timingEvents,
+  viewerTimingEvent,
   showTimingPanel,
   setShowTimingPanel,
   selectedPdfLabel,
@@ -2408,6 +2409,7 @@ export default function App() {
         runReviewReindexQueue={runReviewReindexQueue}
         stopAllProcessing={stopAllProcessing}
         timingEvents={timingEvents}
+        viewerTimingEvent={viewerTimingEvent}
         showTimingPanel={showTimingPanel}
         setShowTimingPanel={setShowTimingPanel}
         selectedPdfLabel={selectedSavedPdf?.filename || selectedSavedPdf?.cnr_number || selectedSavedPdf?.pdf_id || ""}
