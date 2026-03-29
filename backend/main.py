@@ -995,6 +995,8 @@ Task:
 - If the page is one part of a multi-page TOC, extract only the rows visible on this page.
 - Include courtFee and sheet count only if visible; otherwise keep them empty.
 - Return [] if the page is not actually a TOC.
+- Do not invent one broad summary row for the whole PDF; if rows are unreadable, return [].
+- Prefer exact row splitting, wrapped-line merging, and page-number column reading over guessing.
 
 Return only valid JSON:
 [
@@ -1687,6 +1689,14 @@ TOC_NOISE_MARKERS = {
     "case no",
     "advocate",
     "through",
+    "received",
+    "advance copy",
+    "office of",
+    "clerk",
+    "counsel for",
+    "email",
+    "mob.",
+    "mobile",
 }
 
 
@@ -1732,6 +1742,63 @@ def clean_toc_title(title: str) -> str:
     cleaned = normalize_page_digits(re.sub(r"\s+", " ", title or "")).strip(" .:-|\t")
     cleaned = re.sub(r"\b(?:annexure|sheet\s*count|court\s*fee)\b.*$", "", cleaned, flags=re.IGNORECASE).strip(" .:-|\t")
     return cleaned
+
+
+def normalize_toc_parse_line(raw_line: str) -> str:
+    line = normalize_page_digits(re.sub(r"\s+", " ", raw_line or "")).strip()
+    line = line.replace("|", " ")
+    line = re.sub(r"[??]+", " ", line)
+    line = re.sub(r"[??]+", " ", line)
+    line = re.sub(r"\s*[._]{3,}\s*", " ", line)
+    line = re.sub(r"\s+", " ", line).strip(" .:-|\t")
+    return line
+
+
+def split_toc_page_suffix(body: str) -> tuple[str, Optional[int], Optional[int], str]:
+    cleaned = normalize_toc_parse_line(body)
+    patterns = [
+        r"^(?P<title>.*?)(?:\s+(?P<annex>[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?))?\s+(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?$",
+        r"^(?P<title>.*?)(?:\s+(?P<annex>[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?))?\s+(?P<from>\d{1,4})$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, cleaned)
+        if not match:
+            continue
+        title = re.sub(r"\.{2,}$", "", (match.group("title") or "")).strip(" .:-|\t")
+        page_from = int(match.group("from"))
+        page_to = int(match.group("to") or page_from)
+        if page_to < page_from:
+            page_to = page_from
+        return title, page_from, page_to, str(match.group("annex") or "")
+    return cleaned, None, None, ""
+
+
+def is_probable_stamp_noise(line: str) -> bool:
+    lower = (line or "").strip().lower()
+    if not lower:
+        return True
+    if lower in {"received", "clerk"}:
+        return True
+    if re.search(r"(?:office of|advance copy|email|mobile|mob\.?|counsel for)", lower, flags=re.IGNORECASE):
+        return True
+    if re.match(r"^(?:place|date)\s*[:.-]", lower):
+        return True
+    return False
+
+
+def should_append_toc_continuation(line: str) -> bool:
+    normalized = normalize_toc_parse_line(line)
+    if len(normalized) < 2:
+        return False
+    if is_toc_header_line(normalized, ["index", "contents", "table of contents"]) or is_probable_stamp_noise(normalized):
+        return False
+    if re.match(r"^\d{1,3}[\)\.\-: ]+", normalized):
+        return False
+    if re.fullmatch(r"(?:[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?\s+)?\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?", normalized):
+        return False
+    if re.search(r"\b(?:page\s*no|pages?|annexure|sheet|court fee)\b", normalized, flags=re.IGNORECASE):
+        return False
+    return True
 
 
 def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict:
@@ -1810,19 +1877,23 @@ def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
     filtered = []
     previous_was_row = False
     seen_table_header = False
-    range_sep = r"[\-\u2013\u2014]"
+    range_sep = r"[\-–—]"
     for raw_line in (text or "").splitlines():
-        line = normalize_page_digits(re.sub(r"\s+", " ", raw_line)).strip(" |\t")
+        line = normalize_toc_parse_line(raw_line)
         if len(line) < 1:
             previous_was_row = False
             continue
         if is_toc_stop_line(line):
             break
+        if is_probable_stamp_noise(line):
+            previous_was_row = False
+            continue
         if is_toc_noise_line(line) and not re.search(r"\d", line):
             previous_was_row = False
             continue
 
         keep = False
+        title_part, page_from, _page_to, annex = split_toc_page_suffix(line)
         if is_toc_header_line(line, toc_markers):
             keep = True
             seen_table_header = True
@@ -1830,13 +1901,13 @@ def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
             keep = True
         elif seen_table_header and re.match(r"^\d{1,3}[\)\.\-: ]+.+$", line):
             keep = True
-        elif re.search(rf"\.{{2,}}\s*\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?\s*$", line):
+        elif page_from is not None and len(title_part) >= 3:
             keep = True
-        elif re.fullmatch(rf"\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?", line):
+        elif seen_table_header and page_from is not None and annex:
+            keep = True
+        elif re.fullmatch(rf"(?:[A-Za-z]{{1,4}}[-/]\d{{1,4}}[A-Za-z]?\s+)?\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?", line):
             keep = seen_table_header and previous_was_row
-        elif re.search(rf"\b\d{{1,4}}\s*{range_sep}\s*\d{{1,4}}\b", line):
-            keep = seen_table_header or not is_toc_noise_line(line)
-        elif previous_was_row and len(line) <= 220 and not is_toc_header_line(line, toc_markers) and not is_toc_noise_line(line):
+        elif previous_was_row and should_append_toc_continuation(line):
             keep = True
 
         if keep:
@@ -1850,15 +1921,15 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
     pending_item = None
 
     def append_title(target: dict, extra_text: str):
-        extra = extra_text.strip()
+        extra = clean_toc_title(extra_text)
         if not extra:
             return
-        target["title"] = f"{target['title']} {extra}".strip()
+        target["title"] = clean_toc_title(f"{target['title']} {extra}".strip())
         target["displayTitle"] = target["title"]
         target["originalTitle"] = target["title"]
 
     def make_item(serial: str, title: str, page_from: int | None = None, page_to: int | None = None):
-        clean_title = title.strip()
+        clean_title = clean_toc_title(title)
         return {
             "serialNo": serial,
             "title": clean_title,
@@ -1877,13 +1948,15 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
             pending_item = None
 
     for line in lines:
-        normalized_line = normalize_page_digits(re.sub(r"\s+", " ", line)).strip()
+        normalized_line = normalize_toc_parse_line(line)
         if len(normalized_line) < 1:
             continue
         if any(re.search(pattern, normalized_line.lower(), flags=re.IGNORECASE) for pattern in TOC_TABLE_HEADER_PATTERNS):
             continue
+        if is_probable_stamp_noise(normalized_line):
+            continue
 
-        standalone_page_match = re.fullmatch(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?", normalized_line)
+        standalone_page_match = re.fullmatch(r"(?:[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?\s+)?(?P<from>\d{1,4})(?:\s*[\-–—]\s*(?P<to>\d{1,4}))?", normalized_line)
         if standalone_page_match and pending_item:
             page_from = int(standalone_page_match.group("from"))
             page_to = int(standalone_page_match.group("to") or page_from)
@@ -1901,19 +1974,15 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
             serial = serial_match.group("serial")
             body = serial_match.group("body").strip()
 
-        page_match = re.search(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?\s*$", body)
-        if page_match:
-            title = body[:page_match.start()].rstrip(" .:-|\t")
-            title = re.sub(r"\.{2,}$", "", title).strip()
-            page_from = int(page_match.group("from"))
-            page_to = int(page_match.group("to") or page_from)
-            if page_to < page_from:
-                page_to = page_from
+        title, page_from, page_to, annex = split_toc_page_suffix(body)
+        if page_from is not None:
             if len(title) >= 3:
                 finalize_pending_if_ready()
                 items.append(make_item(serial, title, page_from=page_from, page_to=page_to))
                 continue
             if pending_item:
+                if annex and annex.lower() not in pending_item["title"].lower():
+                    append_title(pending_item, annex)
                 pending_item["pageFrom"] = page_from
                 pending_item["pageTo"] = page_to
                 finalize_pending_if_ready()
@@ -1927,11 +1996,11 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
             pending_item = make_item(serial, body)
             continue
 
-        if pending_item and len(body) <= 220:
+        if pending_item and should_append_toc_continuation(body):
             append_title(pending_item, body)
             continue
 
-        if items and len(body) <= 180:
+        if items and should_append_toc_continuation(body) and len(body) <= 180:
             append_title(items[-1], body)
 
     finalize_pending_if_ready()
@@ -1939,6 +2008,7 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
         item for item in items
         if item.get("title") and item.get("pageFrom") is not None and not is_toc_noise_line(item.get("title", ""))
     ]
+
 
 def combine_toc_items(*groups: list[dict]) -> list[dict]:
     combined = []
