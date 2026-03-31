@@ -1834,6 +1834,163 @@ def split_toc_page_suffix(body: str) -> tuple[str, Optional[int], Optional[int],
     return cleaned, None, None, ""
 
 
+COURT_INDEX_HEADER_PATTERNS = [
+    r"\bs\.?\s*no\b",
+    r"\bdescription\s+of\s+documents?\b",
+    r"\bannexures?\b",
+    r"\bpages?\b",
+]
+
+COURT_INDEX_FOOTER_MARKERS = [
+    "jabalpur",
+    "counsel for",
+    "advocate for",
+    "counsel for applicants",
+    "counsel for appellant",
+    "counsel for the applicant",
+]
+
+
+def is_court_index_header_line(line: str) -> bool:
+    normalized = normalize_toc_parse_line(line).lower()
+    if not normalized:
+        return False
+    hits = sum(1 for pattern in COURT_INDEX_HEADER_PATTERNS if re.search(pattern, normalized, flags=re.IGNORECASE))
+    return hits >= 3
+
+
+def is_court_index_footer_line(line: str) -> bool:
+    normalized = normalize_toc_parse_line(line).lower()
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in COURT_INDEX_FOOTER_MARKERS):
+        return True
+    if re.search(r"\b(?:place|date)\s*[:.-]", normalized):
+        return True
+    return False
+
+
+def parse_court_index_row(raw_row: str, default_source: str = "toc-table") -> Optional[dict]:
+    normalized = normalize_toc_parse_line(raw_row)
+    if not normalized:
+        return None
+
+    row_match = re.match(r"^(?P<serial>\d{1,3})[\)\.\-: ]+(?P<body>.+)$", normalized)
+    if not row_match:
+        return None
+
+    serial_no = row_match.group("serial")
+    body = row_match.group("body").strip()
+    body = re.sub(r"\s*\|\s*", " ", body)
+    body = re.sub(r"\s{2,}", " ", body).strip(" .:-|\t")
+
+    suffix_patterns = [
+        r"^(?P<title>.*?)(?:\s+(?P<annex>[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?))?\s+(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?$",
+        r"^(?P<title>.*?)(?:\s+(?P<annex>[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?))\s*$",
+    ]
+    title = body
+    annexure = ""
+    page_from = None
+    page_to = None
+
+    for pattern in suffix_patterns:
+        match = re.match(pattern, body)
+        if not match:
+            continue
+        title = clean_toc_title(match.group("title") or "")
+        annexure = str(match.groupdict().get("annex") or "")
+        page_from = coerce_page_number(match.groupdict().get("from"), None)
+        page_to = coerce_page_number(match.groupdict().get("to"), page_from)
+        break
+
+    if page_from is None:
+        title_guess, page_from_guess, page_to_guess, annex_guess = split_toc_page_suffix(body)
+        if page_from_guess is not None:
+            title = clean_toc_title(title_guess)
+            page_from = page_from_guess
+            page_to = page_to_guess
+            annexure = annexure or annex_guess
+
+    if page_from is None:
+        page_match = re.search(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?\s*$", body)
+        if page_match:
+            page_from = coerce_page_number(page_match.group("from"), None)
+            page_to = coerce_page_number(page_match.group("to"), page_from)
+            title = clean_toc_title(body[:page_match.start()].strip())
+            annex_match = re.search(r"(?:^|\s)(?P<annex>[A-Za-z]{1,4}[-/]\d{1,4}[A-Za-z]?)\s*$", title)
+            if annex_match:
+                annexure = annex_match.group("annex")
+                title = clean_toc_title(title[:annex_match.start()].strip())
+
+    title = clean_toc_title(title)
+    if not title or page_from is None:
+        return None
+    if page_to is None or page_to < page_from:
+        page_to = page_from
+
+    row = {
+        "serialNo": serial_no,
+        "title": title,
+        "displayTitle": title,
+        "originalTitle": title,
+        "pageFrom": page_from,
+        "pageTo": page_to,
+        "source": default_source,
+    }
+    if annexure:
+        row["annexure"] = annexure
+    return row
+
+
+def parse_court_index_table_items(text: str, default_source: str = "toc-table") -> list[dict]:
+    rows: list[dict] = []
+    if not text:
+        return rows
+
+    in_table = False
+    current_row = ""
+    candidate_lines = [normalize_toc_parse_line(line) for line in (text or "").splitlines()]
+
+    def flush_current():
+        nonlocal current_row
+        parsed = parse_court_index_row(current_row, default_source=default_source)
+        if parsed:
+            rows.append(parsed)
+        current_row = ""
+
+    for line in candidate_lines:
+        if not line:
+            continue
+        if not in_table:
+            if is_court_index_header_line(line):
+                in_table = True
+            continue
+
+        if re.match(r"^\d{1,3}[\)\.\-: ]+", line):
+            flush_current()
+            current_row = line
+            continue
+
+        if is_court_index_footer_line(line) or is_toc_stop_line(line):
+            flush_current()
+            break
+
+        if current_row:
+            current_row = f"{current_row} {line}".strip()
+
+    flush_current()
+
+    deduped_rows = []
+    seen = set()
+    for row in rows:
+        key = (row.get("serialNo"), row.get("title"), row.get("pageFrom"), row.get("pageTo"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_rows.append(row)
+    return deduped_rows
+
+
 def is_probable_stamp_noise(line: str) -> bool:
     lower = (line or "").strip().lower()
     if not lower:
@@ -3832,7 +3989,9 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
         result = {
             "page_nums": [],
             "filtered_lines": [],
+            "table_blocks": [],
             "rule_items": [],
+            "table_items": [],
             "text_items": [],
             "image_items": [],
             "qualities": {},
@@ -3867,6 +4026,7 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
                 result["skipped_pages"].append(page_num)
             debug_dump(f"TOC direct text page {page_num}", direct_text)
             debug_dump(f"TOC isolated block page {page_num}", toc_block_text)
+            result["table_blocks"].append(toc_block_text)
             filtered_lines.extend(filter_toc_lines(toc_block_text, toc_markers))
 
         deduped_lines = []
@@ -3885,13 +4045,20 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
         log.info("TOC candidate line count for %s: %s", req.pdf_id, result["candidate_line_count"])
         debug_dump("TOC filtered lines", "\n".join(filtered_lines))
 
+        raw_table_text = "\n".join(block for block in result["table_blocks"] if block)
+        result["table_items"] = parse_court_index_table_items(raw_table_text, default_source="toc-table")
+        if result["table_items"]:
+            result["qualities"]["table"] = evaluate_toc_items_confidence(result["table_items"], toc_range_end)
+            quality = result["qualities"]["table"]
+            log.info("TOC table quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s", req.pdf_id, quality["kept_items"], quality["total_items"], quality["coverage_ratio"], quality["ascending_ratio"], quality["rejected_titles"])
+
         result["rule_items"] = parse_rule_based_toc_items(filtered_lines, default_source="toc")
         if result["rule_items"]:
             result["qualities"]["rule"] = evaluate_toc_items_confidence(result["rule_items"], toc_range_end)
             quality = result["qualities"]["rule"]
             log.info("TOC rule quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s", req.pdf_id, quality["kept_items"], quality["total_items"], quality["coverage_ratio"], quality["ascending_ratio"], quality["rejected_titles"])
 
-        result["force_image_retry"] = should_force_image_toc_retry(candidate_pages, result, toc_markers, result["qualities"].get("rule"))
+        result["force_image_retry"] = should_force_image_toc_retry(candidate_pages, result, toc_markers, result["qualities"].get("table") or result["qualities"].get("rule"))
         if result["force_image_retry"]:
             log.info("Forcing TOC image retry for %s on pages %s after weak/noisy scanned TOC parse", req.pdf_id, result["page_nums"])
 
@@ -3948,7 +4115,13 @@ Return only valid JSON:
         if best_quality.get("quality"):
             result["rejected_titles"] = list(best_quality["quality"].get("rejected_titles") or [])
             chosen_items = list(best_quality["quality"].get("items") or [])
-            resolved_source = "toc-image" if best_quality.get("source") == "image" else "toc"
+            source_name = best_quality.get("source")
+            if source_name == "image":
+                resolved_source = "toc-image"
+            elif source_name == "table":
+                resolved_source = "toc-table"
+            else:
+                resolved_source = "toc"
             if best_quality.get("accepted"):
                 result["accepted_items"] = chosen_items
                 result["accepted_source"] = resolved_source
@@ -3961,6 +4134,7 @@ Return only valid JSON:
     toc_source = ""
     toc_page_nums = []
     toc_rule_items = []
+    toc_table_items = []
     toc_image_items = []
     toc_text_items = []
     explicit_toc_detected = False
@@ -4015,6 +4189,7 @@ Return only valid JSON:
             chosen = chosen_bundle["best_pass"]
             toc_page_nums = chosen.get("page_nums") or []
             toc_rule_items = chosen.get("rule_items") or []
+            toc_table_items = chosen.get("table_items") or []
             toc_text_items = chosen.get("text_items") or []
             toc_image_items = chosen.get("image_items") or []
             debug_report["toc"]["selected_bundle"] = toc_page_nums
