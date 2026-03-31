@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import "./App.css";
 import { documentCatalog } from "./documentCatalog";
 
@@ -1191,6 +1191,10 @@ export default function App() {
   const indexSectionRef = useRef(null);
   const indexSpotlightTimeoutRef = useRef(null);
   const pdfCacheRef = useRef(new Map());
+  const apiSupportRef = useRef({
+    queues: true,
+    batchReports: true,
+  });
 
   const rebuildCoverage = useCallback((items, total) => {
     const cmap = {};
@@ -1343,10 +1347,20 @@ export default function App() {
   }, []);
 
   const fetchQueues = useCallback(async () => {
+    if (!apiSupportRef.current.queues) {
+      setQueueSnapshot(EMPTY_QUEUE_SNAPSHOT);
+      return;
+    }
     try {
       const resp = await apiFetch("/api/queues");
       setQueueSnapshot(resp || EMPTY_QUEUE_SNAPSHOT);
     } catch (err) {
+      const msg = String(err?.message || "");
+      if (msg.includes("/api/queues") && msg.toLowerCase().includes("not found")) {
+        apiSupportRef.current.queues = false;
+        setQueueSnapshot(EMPTY_QUEUE_SNAPSHOT);
+        return;
+      }
       console.error(err);
     }
   }, []);
@@ -1367,10 +1381,20 @@ export default function App() {
   }, []);
 
   const fetchBatchReports = useCallback(async () => {
+    if (!apiSupportRef.current.batchReports) {
+      setBatchReports([]);
+      return;
+    }
     try {
       const resp = await apiFetch('/api/batch-reports?limit=8');
       setBatchReports(resp.reports || []);
     } catch (err) {
+      const msg = String(err?.message || "");
+      if (msg.includes("/api/batch-reports") && msg.toLowerCase().includes("not found")) {
+        apiSupportRef.current.batchReports = false;
+        setBatchReports([]);
+        return;
+      }
       console.error(err);
       setBatchReports([]);
     }
@@ -1497,8 +1521,8 @@ export default function App() {
     fetchBatchReports();
     const timer = setInterval(() => {
       fetchSavedPdfs(pdfSearch);
-      fetchQueues();
-      fetchBatchReports();
+      if (apiSupportRef.current.queues) fetchQueues();
+      if (apiSupportRef.current.batchReports) fetchBatchReports();
       if (selectedSavedPdfId) {
         fetchPdfTimings(selectedSavedPdfId);
       }
@@ -1677,44 +1701,46 @@ export default function App() {
       await apiFetch("/health");
 
       let resp;
+      let activePdfId = pdfId;
       if (isRealFile(pdfFile)) {
-        setLoadingStep(`Starting full-document indexing for ${totalPages} pages...`);
+        setLoadingStep(`Uploading and extracting pages for ${totalPages} pages...`);
         const formData = new FormData();
         formData.append("file", pdfFile);
         formData.append("start_page", String(start));
         formData.append("end_page", String(end));
-        resp = await apiUpload("/api/index-runner/upload", formData);
-        if (!resp.started) {
-          if (resp.skipped_duplicate && resp.existing?.pdf_id) {
-            setPdfId(resp.existing.pdf_id);
-            await loadSavedPdf(resp.existing.pdf_id);
-            await fetchSavedPdfs(pdfSearch);
-            await fetchQueues();
-            return;
-          }
-          throw new Error(resp.message || "Background indexing is already running.");
-        }
-        setPdfId(resp.pdf_id);
-        handledIndexRunnerRef.current = "";
+        resp = await apiUpload("/api/ingest", formData);
+        activePdfId = resp.pdf_id;
+        setPdfId(activePdfId);
       } else if (pdfId) {
-        setLoadingStep(`Starting full-document re-indexing for ${totalPages} pages...`);
-        const formData = new FormData();
-        formData.append("start_page", String(start));
-        formData.append("end_page", String(end));
-        resp = await apiUpload(`/api/index-runner/saved/${pdfId}`, formData);
-        if (!resp.started) {
-          throw new Error(resp.message || "Background indexing is already running.");
-        }
-        handledIndexRunnerRef.current = "";
+        activePdfId = pdfId;
       } else {
         throw new Error("No upload source found for this PDF.");
       }
 
-      setWorkflowStatus("indexing_running");
-      setChatReady(false);
+      if (!activePdfId) {
+        throw new Error("Backend did not return a PDF ID.");
+      }
+
+      setLoadingStep("Building document index...");
+      const indexResp = await apiFetch("/api/generate-index", {
+        method: "POST",
+        body: JSON.stringify({ pdf_id: activePdfId }),
+      });
+      const normalized = normalizeSections(indexResp.index || [], caseInfo?.batchNo || "");
+      setSections(normalized);
+      rebuildCoverage(normalized, totalPages);
+      setIndexedRange({
+        start: indexResp.indexed_page_start,
+        end: indexResp.indexed_page_end,
+        count: indexResp.indexed_pages,
+      });
+      setWorkflowStatus(indexResp.status || resp?.status || "index_ready");
+      setRetrievalStatus(indexResp.retrieval_status || resp?.retrieval_status || "");
+      setPendingPages(indexResp.pending_pages ?? resp?.pending_pages ?? 0);
+      setChatReady(Boolean(indexResp.chat_ready ?? resp?.chat_ready));
       setBatchFilter((value) => value || caseInfo?.batchNo || "");
       await fetchSavedPdfs(pdfSearch);
-      await fetchQueues();
+      fetchQueues().catch(() => {});
     } catch (err) {
       console.error(err);
       setError(err.message);
@@ -1723,7 +1749,6 @@ export default function App() {
       setLoadingStep("");
     }
   };
-
   const regenIndex = async () => {
     if (!pdfId) return;
     setLoading(true);
@@ -1785,7 +1810,7 @@ export default function App() {
       })());
       setRetrievalStatus("queued_for_full_ingestion");
       fetchSavedPdfs(pdfSearch);
-      fetchQueues();
+      if (apiSupportRef.current.queues) fetchQueues();
     } catch (err) {
       setError(err.message);
     }
@@ -2043,9 +2068,9 @@ export default function App() {
             Batch Upload
             <input type="file" accept=".pdf" multiple style={{ display: "none" }} onChange={handleBatchUpload} />
           </label>
-          {pdfFile && <span className="nav-filename">{pdfFile.name} · {totalPages}p</span>}
+          {pdfFile && <span className="nav-filename">{pdfFile.name} - {totalPages}p</span>}
           {sections.length > 0 && (
-            <span className="coverage-pill">OK {covered}/{totalPages} pages · {sections.length} entries</span>
+            <span className="coverage-pill">OK {covered}/{totalPages} pages - {sections.length} entries</span>
           )}
         </div>
       </nav>
@@ -2515,4 +2540,5 @@ export default function App() {
     </div>
   );
 }
+
 

@@ -1423,6 +1423,77 @@ async def list_pdfs():
     return {"pdfs": list_pdf_records()}
 
 
+
+@app.get("/api/queues")
+async def get_queues():
+    """Compatibility endpoint for frontend queue polling when runner APIs are not enabled."""
+    return {
+        "index_ready": [],
+        "stage1_batch": [],
+        "pending_vectorization": [],
+        "vectorized": [],
+        "reindex_review": [],
+        "errors": [],
+        "runner": {
+            "running": False,
+            "processed": 0,
+            "total": 0,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": "",
+            "pause_requested": False,
+            "paused": False,
+            "heartbeat_ts": 0,
+        },
+        "index_runner": {
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": "",
+            "finished_pdf_id": "",
+            "finished_filename": "",
+            "status": "idle",
+        },
+        "stage1_batch_runner": {
+            "running": False,
+            "processed": 0,
+            "total": 0,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": "",
+            "heartbeat_ts": 0,
+            "status": "idle",
+        },
+        "audit_runner": {
+            "running": False,
+            "processed": 0,
+            "total": 0,
+            "flagged": 0,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": "",
+            "heartbeat_ts": 0,
+            "status": "idle",
+        },
+        "reindex_runner": {
+            "running": False,
+            "processed": 0,
+            "total": 0,
+            "fixed": 0,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "last_error": "",
+            "heartbeat_ts": 0,
+            "status": "idle",
+        },
+    }
+
+
+@app.get("/api/batch-reports")
+async def get_batch_reports(limit: int = 8):
+    """Compatibility endpoint for frontend batch report polling."""
+    return {"reports": [], "limit": max(1, min(limit, 100))}
+
 @app.get("/api/pdf-status/{pdf_id}")
 async def get_pdf_status(pdf_id: str):
     record = get_pdf_record(pdf_id)
@@ -1550,3 +1621,4 @@ async def startup():
     log.info(f"Text model   : {TEXT_MODEL}")
     log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
     log.info("Server ready")
+
