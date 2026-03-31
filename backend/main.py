@@ -3734,6 +3734,7 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
     indexed_end = all_pages[-1]["page_num"]
     total_pages = record["total_pages"] if record else indexed_end
     total_chunks = len(all_pages)
+    toc_range_end = total_pages if record else indexed_end
 
     toc_markers = [
         "table of contents",
