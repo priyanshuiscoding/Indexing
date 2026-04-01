@@ -90,6 +90,7 @@ def _init_sqlite_db():
             );
             """
         )
+
         _ensure_column(conn, "pdf_records", "cnr_number", "cnr_number TEXT DEFAULT ''")
         _ensure_column(conn, "pdf_records", "file_size_bytes", "file_size_bytes INTEGER DEFAULT 0")
         _ensure_column(conn, "pdf_records", "queue_bucket", "queue_bucket TEXT DEFAULT 'index'")
@@ -172,6 +173,7 @@ def upsert_pdf_record(
     now = utc_now_iso()
     pending_pages = pending_pages if pending_pages is not None else max(total_pages - indexed_pages, 0)
     batch_enqueued_at = str(batch_enqueued_at or "")
+
     conn = get_connection()
     try:
         if _is_postgres():
@@ -259,6 +261,7 @@ def upsert_pdf_record(
 def update_pdf_record(pdf_id: str, **fields):
     if not fields:
         return
+
     fields["updated_at"] = utc_now_iso()
     conn = get_connection()
     try:
@@ -274,6 +277,7 @@ def update_pdf_record(pdf_id: str, **fields):
         conn.commit()
     finally:
         conn.close()
+
 
 def replace_extracted_pages(pdf_id: str, pages_data: list[dict], stage: str):
     now = utc_now_iso()
@@ -291,8 +295,16 @@ def replace_extracted_pages(pdf_id: str, pages_data: list[dict], stage: str):
                     """,
                     [
                         (
-                            pdf_id, page["page_num"], page["text"], bool(page["used_ocr"]), bool(page["vision_used"]),
-                            bool(page["handwriting_suspected"]), page["extraction_method"], stage, now, now,
+                            pdf_id,
+                            page["page_num"],
+                            page["text"],
+                            bool(page["used_ocr"]),
+                            bool(page["vision_used"]),
+                            bool(page["handwriting_suspected"]),
+                            page["extraction_method"],
+                            stage,
+                            now,
+                            now,
                         )
                         for page in pages_data
                     ],
@@ -308,8 +320,16 @@ def replace_extracted_pages(pdf_id: str, pages_data: list[dict], stage: str):
                 """,
                 [
                     (
-                        pdf_id, page["page_num"], page["text"], int(page["used_ocr"]), int(page["vision_used"]),
-                        int(page["handwriting_suspected"]), page["extraction_method"], stage, now, now,
+                        pdf_id,
+                        page["page_num"],
+                        page["text"],
+                        int(page["used_ocr"]),
+                        int(page["vision_used"]),
+                        int(page["handwriting_suspected"]),
+                        page["extraction_method"],
+                        stage,
+                        now,
+                        now,
                     )
                     for page in pages_data
                 ],
@@ -342,8 +362,16 @@ def upsert_extracted_pages(pdf_id: str, pages_data: list[dict], stage: str):
                     """,
                     [
                         (
-                            pdf_id, page["page_num"], page["text"], bool(page["used_ocr"]), bool(page["vision_used"]),
-                            bool(page["handwriting_suspected"]), page["extraction_method"], stage, now, now,
+                            pdf_id,
+                            page["page_num"],
+                            page["text"],
+                            bool(page["used_ocr"]),
+                            bool(page["vision_used"]),
+                            bool(page["handwriting_suspected"]),
+                            page["extraction_method"],
+                            stage,
+                            now,
+                            now,
                         )
                         for page in pages_data
                     ],
@@ -366,8 +394,16 @@ def upsert_extracted_pages(pdf_id: str, pages_data: list[dict], stage: str):
                 """,
                 [
                     (
-                        pdf_id, page["page_num"], page["text"], int(page["used_ocr"]), int(page["vision_used"]),
-                        int(page["handwriting_suspected"]), page["extraction_method"], stage, now, now,
+                        pdf_id,
+                        page["page_num"],
+                        page["text"],
+                        int(page["used_ocr"]),
+                        int(page["vision_used"]),
+                        int(page["handwriting_suspected"]),
+                        page["extraction_method"],
+                        stage,
+                        now,
+                        now,
                     )
                     for page in pages_data
                 ],
@@ -389,6 +425,7 @@ def get_cached_pages(pdf_id: str, start_page: Optional[int] = None, end_page: Op
             if end_page is not None:
                 clauses.append("page_num <= %s")
                 params.append(end_page)
+
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -409,6 +446,7 @@ def get_cached_pages(pdf_id: str, start_page: Optional[int] = None, end_page: Op
             if end_page is not None:
                 clauses.append("page_num <= ?")
                 params.append(end_page)
+
             rows = conn.execute(
                 f"""
                 SELECT page_num, text, used_ocr, vision_used, handwriting_suspected, extraction_method, stage
@@ -418,6 +456,7 @@ def get_cached_pages(pdf_id: str, start_page: Optional[int] = None, end_page: Op
                 """,
                 params,
             ).fetchall()
+
         return [
             {
                 "page_num": row["page_num"],
@@ -437,6 +476,7 @@ def get_cached_pages(pdf_id: str, start_page: Optional[int] = None, end_page: Op
 def save_index(pdf_id: str, index_items: list[dict]):
     now = utc_now_iso()
     payload = json.dumps(index_items or [], ensure_ascii=False)
+
     conn = get_connection()
     try:
         if _is_postgres():
@@ -469,7 +509,7 @@ def save_index(pdf_id: str, index_items: list[dict]):
         conn.close()
 
 
-def get_saved_index(pdf_id: str) -> list[dict]:
+def get_saved_index(pdf_id: str) -> Optional[list[dict]]:
     conn = get_connection()
     try:
         if _is_postgres():
@@ -478,14 +518,17 @@ def get_saved_index(pdf_id: str) -> list[dict]:
                 row = cur.fetchone()
         else:
             row = conn.execute("SELECT index_json FROM saved_indexes WHERE pdf_id = ?", (pdf_id,)).fetchone()
+
         if not row:
-            return []
+            return None
+
         payload = row["index_json"]
         if isinstance(payload, str):
             return json.loads(payload or "[]")
         return payload or []
     finally:
         conn.close()
+
 
 def list_pdf_records(search: str = "") -> list[dict]:
     conn = get_connection()
@@ -497,6 +540,7 @@ def list_pdf_records(search: str = "") -> list[dict]:
                 like = f"%{search.strip()}%"
                 clauses.append("(filename ILIKE %s OR cnr_number ILIKE %s OR pdf_id ILIKE %s)")
                 params.extend([like, like, like])
+
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -518,6 +562,7 @@ def list_pdf_records(search: str = "") -> list[dict]:
                 like = f"%{search.strip()}%"
                 clauses.append("(filename LIKE ? OR cnr_number LIKE ? OR pdf_id LIKE ?)")
                 params.extend([like, like, like])
+
             rows = conn.execute(
                 f"""
                 SELECT pdf_id, filename, cnr_number, file_size_bytes, total_pages, indexed_pages,
@@ -530,6 +575,7 @@ def list_pdf_records(search: str = "") -> list[dict]:
                 """,
                 params,
             ).fetchall()
+
         return [_row_to_record(row) for row in rows]
     finally:
         conn.close()
@@ -563,6 +609,7 @@ def list_pending_pdf_ids() -> list[str]:
                 ORDER BY updated_at ASC
                 """
             ).fetchall()
+
         return [row["pdf_id"] for row in rows]
     finally:
         conn.close()
@@ -582,6 +629,7 @@ def list_reindex_review_pdf_ids() -> list[str]:
             rows = conn.execute(
                 "SELECT pdf_id FROM pdf_records WHERE queue_bucket = 'reindex_review' ORDER BY updated_at ASC"
             ).fetchall()
+
         return [row["pdf_id"] for row in rows]
     finally:
         conn.close()
@@ -613,6 +661,7 @@ def list_stage1_batch_pdf_ids() -> list[str]:
                 ORDER BY updated_at ASC
                 """
             ).fetchall()
+
         return [row["pdf_id"] for row in rows]
     finally:
         conn.close()
@@ -623,7 +672,10 @@ def build_queue_snapshot() -> dict:
     return {
         "index_ready": [record for record in records if record.get("index_ready")],
         "stage1_batch": [record for record in records if record.get("queue_bucket") == "stage1_batch"],
-        "pending_vectorization": [record for record in records if record.get("pending_pages", 0) > 0 and record.get("queue_bucket") != "stage1_batch"],
+        "pending_vectorization": [
+            record for record in records
+            if record.get("pending_pages", 0) > 0 and record.get("queue_bucket") != "stage1_batch"
+        ],
         "vectorized": [record for record in records if record.get("chat_ready")],
         "reindex_review": [record for record in records if record.get("queue_bucket") == "reindex_review"],
         "errors": [record for record in records if record.get("last_error")],

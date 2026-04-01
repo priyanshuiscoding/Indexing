@@ -4,9 +4,7 @@ FastAPI server handling:
   - PDF ingestion (OCR + vectorization)
   - Semantic search / chatbot queries
   - Automatic index generation
-
-  
-      - NVIDIA API proxy (avoids browser CORS)
+  - NVIDIA API proxy (avoids browser CORS)
 """
 
 import os
@@ -22,7 +20,7 @@ from io import BytesIO
 from threading import Lock
 from typing import Optional
 
-import fitz                        # PyMuPDF
+import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 from dotenv import load_dotenv
@@ -39,10 +37,12 @@ from workflow_state import (
     delete_pdf_state,
     get_cached_pages,
     get_pdf_record,
+    get_saved_index,
     init_db as init_workflow_db,
     list_pdf_records,
     list_pending_pdf_ids,
     replace_extracted_pages,
+    save_index,
     update_pdf_record,
     upsert_extracted_pages,
     upsert_pdf_record,
@@ -60,7 +60,9 @@ os.environ.setdefault("TRANSFORMERS_CACHE", HF_CACHE_PATH)
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", HF_CACHE_PATH)
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 Path(HF_CACHE_PATH).mkdir(parents=True, exist_ok=True)
+
 DOCUMENT_CATALOG_PATH = Path(__file__).resolve().parent.parent / "document_catalog.json"
+
 
 def normalize_api_key(raw_value: str) -> str:
     """Accept keys with accidental quotes or a leading 'Bearer ' prefix."""
@@ -70,38 +72,42 @@ def normalize_api_key(raw_value: str) -> str:
     return value
 
 
-NVIDIA_API_KEY   = normalize_api_key(os.getenv("NVIDIA_API_KEY", ""))
-VISION_MODEL     = os.getenv("VISION_MODEL", "mistralai/mistral-small-3.1-24b-instruct-2503")
-TEXT_MODEL       = os.getenv("TEXT_MODEL",   "mistralai/mistral-small-3.1-24b-instruct-2503")
-NVIDIA_BASE_URL  = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-CHROMA_DB_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+NVIDIA_API_KEY = normalize_api_key(os.getenv("NVIDIA_API_KEY", ""))
+VISION_MODEL = os.getenv("VISION_MODEL", "mistralai/mistral-small-3.1-24b-instruct-2503")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "mistralai/mistral-small-3.1-24b-instruct-2503")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
-TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
+TESSERACT_LANG = os.getenv("TESSERACT_LANG", "hin+eng")
 ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "true").lower() != "false"
+
 try:
     PARENT_DOCUMENT_CATALOG = json.loads(DOCUMENT_CATALOG_PATH.read_text(encoding="utf-8"))
 except Exception:
     PARENT_DOCUMENT_CATALOG = []
-PARENT_DOCUMENT_NAMES = list(dict.fromkeys(
-    item["name"].strip()
-    for item in PARENT_DOCUMENT_CATALOG
-    if item.get("name") and str(item["name"]).strip()
-))
+
+PARENT_DOCUMENT_NAMES = list(
+    dict.fromkeys(
+        item["name"].strip()
+        for item in PARENT_DOCUMENT_CATALOG
+        if item.get("name") and str(item["name"]).strip()
+    )
+)
 PARENT_DOCUMENT_EMBEDDINGS = None
 GENERIC_PARENT_NAMES = {"other", "others"}
+
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 USING_DEFAULT_NVIDIA_ENDPOINT = NVIDIA_BASE_URL.rstrip("/") == DEFAULT_NVIDIA_BASE_URL
-# Local OpenAI-compatible endpoints (for example Qwen/vLLM) can run without an API key.
 MODEL_API_READY = bool(NVIDIA_API_KEY) or not USING_DEFAULT_NVIDIA_ENDPOINT
 MODEL_API_KEY_FOR_CLIENT = NVIDIA_API_KEY or ("local-no-key" if MODEL_API_READY else "")
 
-# ── NVIDIA client ──────────────────────────────────────────────────────────────
+# ── NVIDIA client ─────────────────────────────────────────────────────────────
 nvidia_client = OpenAI(
     base_url=NVIDIA_BASE_URL,
     api_key=MODEL_API_KEY_FOR_CLIENT,
 )
 
-# ── Embedding model (local, offline, Hindi+English) ───────────────────────────
+# ── Embedding model ───────────────────────────────────────────────────────────
 embedder = None
 embedder_lock = Lock()
 
@@ -113,8 +119,8 @@ chroma_client = chromadb.PersistentClient(
     settings=Settings(anonymized_telemetry=False),
 )
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
-app = FastAPI(title="Court File Indexer API", version="2.0.0")
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Court File Indexer API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,23 +129,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ═════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def pdf_id_from_bytes(data: bytes) -> str:
-    """Stable ID for a PDF based on its content hash."""
     return hashlib.md5(data).hexdigest()[:16]
 
 
 def stored_pdf_path(pdf_id: str) -> Path:
-    """Local on-disk copy of the uploaded PDF for later page-image reprocessing."""
     return Path(PDF_STORAGE_PATH) / f"{pdf_id}.pdf"
 
 
 def get_or_create_collection(pdf_id: str):
-    """Get or create a ChromaDB collection for this PDF."""
     name = f"pdf_{pdf_id}"
     try:
         return chroma_client.get_collection(name)
@@ -151,7 +153,6 @@ def get_or_create_collection(pdf_id: str):
 
 
 def get_embedder():
-    """Load the embedding model only when vector work is actually needed."""
     global embedder
     if embedder is None:
         with embedder_lock:
@@ -165,14 +166,13 @@ def get_embedder():
                         cache_folder=HF_CACHE_PATH,
                     )
                     log.info("Embedding model ready")
-                except Exception as e:
+                except Exception as exc:
                     embedder = False
-                    log.exception("Falling back to lightweight local embeddings: %s", e)
+                    log.exception("Falling back to lightweight local embeddings: %s", exc)
     return embedder
 
 
 def fallback_embed_texts(texts: list[str], dims: int = 384) -> list[list[float]]:
-    """Simple local embedding fallback when transformer weights cannot load."""
     vectors = []
     for text in texts:
         vec = [0.0] * dims
@@ -188,7 +188,6 @@ def fallback_embed_texts(texts: list[str], dims: int = 384) -> list[list[float]]
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a list of strings using the local multilingual model."""
     model = get_embedder()
     if model is False:
         return fallback_embed_texts(texts)
@@ -197,24 +196,21 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def ocr_page_image(image: Image.Image) -> str:
-    """Run Tesseract OCR on a PIL image. Returns extracted text."""
     try:
         text = pytesseract.image_to_string(image, lang=TESSERACT_LANG, config="--psm 6")
         return text.strip()
-    except Exception as e:
-        log.warning(f"Tesseract OCR failed: {e}")
+    except Exception as exc:
+        log.warning("Tesseract OCR failed: %s", exc)
         return ""
 
 
 def render_page_image(page: fitz.Page, dpi: int = 250) -> Image.Image:
-    """Render a PDF page to a PIL image for OCR and vision extraction."""
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
 def image_to_jpeg_base64(image: Image.Image, max_side: int = 1800, quality: int = 80) -> str:
-    """Convert a PIL image to base64 JPEG, shrinking large pages for vision OCR."""
     img = image.copy()
     resampling = getattr(Image, "Resampling", Image)
     img.thumbnail((max_side, max_side), resampling.LANCZOS)
@@ -252,7 +248,6 @@ def analyze_extracted_text(text: str) -> dict:
 
 
 def should_try_handwritten_assist(direct_text: str, ocr_text: str) -> bool:
-    """Heuristic gate for hard scanned pages where Tesseract is likely insufficient."""
     ocr_stats = analyze_extracted_text(ocr_text)
     direct_stats = analyze_extracted_text(direct_text)
     likely_scan = direct_stats["chars"] < 30
@@ -263,7 +258,6 @@ def should_try_handwritten_assist(direct_text: str, ocr_text: str) -> bool:
 
 
 def extract_handwritten_page_text(image: Image.Image, page_num: int) -> Optional[str]:
-    """Use the vision model as a higher-accuracy fallback for handwritten Hindi/English pages."""
     if not ENABLE_HANDWRITTEN_HINDI_ASSIST or not MODEL_API_READY:
         return None
 
@@ -291,13 +285,6 @@ Return only the transcription for page {page_num}."""
 
 
 def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict:
-    """
-    Extract text from a PDF page.
-    First tries direct text extraction (fast, perfect for digital PDFs).
-    Falls back to OCR if the page is a scan.
-    For hard handwritten/low-quality Hindi pages, optionally uses the vision model
-    to improve the stored text used by indexing and chat.
-    """
     direct_text = page.get_text("text").strip()
     if len(direct_text) > 30:
         clean = re.sub(r"\n{3,}", "\n\n", direct_text)
@@ -336,10 +323,6 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 200) -> dict
 
 
 def extract_toc_from_page_images(pdf_path: Path, page_nums: list[int]) -> list[dict]:
-    """
-    Use page images for TOC extraction with improved structured table detection.
-    Now focuses specifically on extracting table rows with Sr.No, Title, Page columns.
-    """
     if not page_nums or not pdf_path.exists() or not MODEL_API_READY:
         return []
 
@@ -354,12 +337,10 @@ def extract_toc_from_page_images(pdf_path: Path, page_nums: list[int]) -> list[d
         for page_num in page_nums:
             if page_num < 1 or page_num > doc.page_count:
                 continue
-            
-            # IMPROVEMENT: Higher DPI for table text clarity
+
             image = render_page_image(doc[page_num - 1], dpi=300)
             image_b64 = image_to_jpeg_base64(image, max_side=2400, quality=90)
-            
-            # IMPROVED PROMPT: Specific to structured table extraction
+
             prompt = f"""You are reading an INDEX / TABLE OF CONTENTS page from an Indian court file.
 
 This page contains a STRUCTURED TABLE with these columns:
@@ -369,20 +350,16 @@ This page contains a STRUCTURED TABLE with these columns:
 - Page No / Page Number (page number or range on the right)
 
 EXTRACTION RULES:
-1. Extract EVERY complete table row in order (Sr.No 1, 2, 3...)
-2. Preserve original text exactly (Hindi Devanagari, English, mixed)
-3. If a title spans multiple lines within one table row, combine them
-4. If Sr.No blank, infer from sequence (after Sr.No 5, next is 6)
-5. Page numbers: Convert Hindi digits (०-९) to Arabic (0-9) for pageFrom/pageTo ONLY
-6. If only ONE page shown, use same for pageFrom and pageTo
-7. If range shown ("1-4", "1 to 4", "1_4"), extract start and end
-8. Include Annexure column if visible, else empty string
+1. Extract EVERY complete table row in order.
+2. Preserve original text exactly (Hindi Devanagari, English, mixed).
+3. If a title spans multiple lines within one table row, combine them.
+4. If Sr.No blank, infer from sequence.
+5. Page numbers: Convert Hindi digits (०-९) to Arabic (0-9) for pageFrom/pageTo ONLY.
+6. If only ONE page shown, use same for pageFrom and pageTo.
+7. If range shown ("1-4", "1 to 4", "1_4"), extract start and end.
+8. Include Annexure column if visible, else empty string.
 
-TABLE STRUCTURE YOU'LL SEE:
-- Header row: "Sr. No | Particulars of the Documents | Annexure | Page No"
-- Data rows: "1 | Index | - | 1" or "२ | Description | C-१ | २-३"
-
-RETURN ONLY JSON (no markdown, no text):
+RETURN ONLY JSON:
 [
   {{
     "serialNo": "1",
@@ -390,53 +367,39 @@ RETURN ONLY JSON (no markdown, no text):
     "annexure": "",
     "pageFrom": 1,
     "pageTo": 1
-  }},
-  {{
-    "serialNo": "2",
-    "title": "Chronology of events",
-    "annexure": "",
-    "pageFrom": 2,
-    "pageTo": 3
   }}
 ]
 
 CRITICAL RULES:
-- Return [] if NOT an INDEX/TOC table
-- Extract ALL rows visible in the table
-- Use exact original text (don't translate Hindi)
-- No markdown backticks, no extra text, only JSON array"""
+- Return [] if NOT an INDEX/TOC table.
+- Extract ALL rows visible in the table.
+- Use exact original text.
+- No markdown backticks, no extra text, only JSON array."""
 
             raw = call_nvidia_vision(image_b64, "image/jpeg", prompt, max_tokens=3500)
             parsed = safe_json(raw)
-            
+
             if isinstance(parsed, list) and parsed:
-                # Validate and clean the extracted items
                 valid_items = []
                 for row in parsed:
                     if isinstance(row, dict) and row.get("title", "").strip():
-                        # Ensure proper page number coercion
                         row["pageFrom"] = coerce_page_number(row.get("pageFrom"), page_num)
                         row["pageTo"] = coerce_page_number(row.get("pageTo"), row.get("pageFrom", page_num))
                         row.setdefault("source", "toc-image")
                         row.setdefault("annexure", "")
                         row.setdefault("serialNo", "")
                         valid_items.append(row)
-                
+
                 if valid_items:
                     toc_items.extend(valid_items)
-                    log.info(f"✓ TOC image extraction: page {page_num} extracted {len(valid_items)} rows")
-                else:
-                    log.info(f"Vision returned list but no valid rows on page {page_num}")
-            else:
-                log.debug(f"No structured TOC found on page {page_num} (vision returned: {type(parsed)})")
-                
+                    log.info("TOC image extraction: page %s extracted %s rows", page_num, len(valid_items))
     finally:
         doc.close()
 
     return toc_items
 
+
 def call_nvidia_text(messages: list[dict], max_tokens: int = 2000, temperature: float = 0.1) -> str:
-    """Call NVIDIA text model (no image). Used for RAG reasoning."""
     resp = nvidia_client.chat.completions.create(
         model=TEXT_MODEL,
         messages=messages,
@@ -447,7 +410,6 @@ def call_nvidia_text(messages: list[dict], max_tokens: int = 2000, temperature: 
 
 
 def call_nvidia_vision(image_b64: str, media_type: str, prompt: str, max_tokens: int = 2000) -> str:
-    """Call NVIDIA vision model with a single image (Mistral limit = 1 image)."""
     resp = nvidia_client.chat.completions.create(
         model=VISION_MODEL,
         messages=[{
@@ -464,10 +426,8 @@ def call_nvidia_vision(image_b64: str, media_type: str, prompt: str, max_tokens:
 
 
 def safe_json(text: str):
-    """Parse JSON from model output, stripping markdown fences."""
     text = re.sub(r"```json|```", "", text).strip()
-    # Find first [ or { and parse from there
-    for start_char, end_char in [("[", "]"), ("{", "}")]:
+    for start_char in ["[", "{"]:
         idx = text.find(start_char)
         if idx != -1:
             try:
@@ -478,13 +438,14 @@ def safe_json(text: str):
 
 
 def coerce_page_number(value, fallback: int) -> int:
-    """Best-effort page parsing so noisy model output does not crash indexing."""
     if isinstance(value, int):
         return value
     if isinstance(value, float):
         return int(value)
     if isinstance(value, str):
-        match = re.search(r"\d+", value)
+        devanagari_map = str.maketrans("०१२३४५६७८९", "0123456789")
+        normalized = value.translate(devanagari_map)
+        match = re.search(r"\d+", normalized)
         if match:
             return int(match.group())
     return fallback
@@ -522,6 +483,7 @@ def normalize_index_items(items: list[dict], indexed_start: int, indexed_end: in
         title = str(item.get("title", "")).strip()
         if not title:
             continue
+
         normalized.append({
             "title": title,
             "displayTitle": str(item.get("displayTitle") or item.get("originalTitle") or title).strip(),
@@ -574,6 +536,7 @@ def extract_pages_from_document(doc: fitz.Document, page_numbers: list[int], tot
         page = doc[page_num - 1]
         page_data = extract_page_content(page, page_num, dpi=dpi)
         text_value = page_data["text"] or f"[Page {page_num} - no readable text detected]"
+
         if page_data["used_ocr"]:
             ocr_count += 1
         if page_data["vision_used"]:
@@ -589,8 +552,9 @@ def extract_pages_from_document(doc: fitz.Document, page_numbers: list[int], tot
             "handwriting_suspected": page_data["handwriting_suspected"],
             "extraction_method": page_data["extraction_method"],
         })
+
         log.info(
-            "  Page %s/%s - %s%s - %s chars",
+            "Page %s/%s - %s%s - %s chars",
             page_num,
             total_pages,
             page_data["extraction_method"],
@@ -612,6 +576,7 @@ def upsert_collection_pages(pdf_id: str, filename: str, pages_data: list[dict], 
             chroma_client.delete_collection(f"pdf_{pdf_id}")
         except Exception:
             pass
+
     collection = get_or_create_collection(pdf_id)
     if not pages_data:
         return collection
@@ -631,6 +596,7 @@ def upsert_collection_pages(pdf_id: str, filename: str, pages_data: list[dict], 
         } for page in batch]
         embeddings = embed_texts(documents)
         collection.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+
     return collection
 
 
@@ -644,23 +610,85 @@ def load_collection_pages(pdf_id: str) -> list[dict]:
     pages = []
     for doc_text, meta in zip(result.get("documents", []), result.get("metadatas", [])):
         pages.append({
-            "page_num": meta["page_num"],
+            "page_num": int(meta["page_num"]),
             "text": doc_text,
             "used_ocr": bool(meta.get("used_ocr")),
             "vision_used": bool(meta.get("vision_used")),
             "handwriting_suspected": bool(meta.get("handwriting_suspected")),
             "extraction_method": meta.get("extraction_method", "unknown"),
-            "stage": "legacy",
+            "stage": "vectorized",
         })
+
     pages.sort(key=lambda item: item["page_num"])
     return pages
 
 
-def load_index_pages(pdf_id: str) -> list[dict]:
+def load_all_pages_for_pdf(pdf_id: str) -> list[dict]:
+    pages = load_collection_pages(pdf_id)
+    if pages:
+        return pages
+
     cached_pages = get_cached_pages(pdf_id)
-    if cached_pages:
-        return cached_pages
-    return load_collection_pages(pdf_id)
+    cached_pages.sort(key=lambda item: item["page_num"])
+    return cached_pages
+
+
+def get_toc_search_pages(all_pages: list[dict], start_page: int = 1, end_page: int = 10) -> list[dict]:
+    return [page for page in all_pages if start_page <= page["page_num"] <= end_page]
+
+
+def detect_toc_candidate_pages(pages: list[dict], max_candidates: int = 5) -> list[dict]:
+    toc_candidate_pages = []
+
+    for page in pages:
+        text = page.get("text", "") or ""
+        lower_text = text.lower()
+
+        strong_match = bool(re.search(
+            r"\bindex\b(?!\s+(?:page|number))|"
+            r"\btable\s+of\s+contents\b|"
+            r"\bcontents\b|"
+            r"विषय\s*सूची|"
+            r"अनुक्रमणिका|"
+            r"सूची",
+            lower_text,
+            re.IGNORECASE,
+        ))
+
+        structural_match = bool(re.search(
+            r"sr\.?\s*no(?:\.)?|"
+            r"क्रम|"
+            r"particulars?\s+of|"
+            r"page\s+no(?:\.)?(?:\s|$)|"
+            r"page\s+number|"
+            r"annexure|"
+            r"sheet\s+count",
+            lower_text,
+            re.IGNORECASE,
+        ))
+
+        lines = text.splitlines()
+        table_row_count = 0
+        for line in lines:
+            cleaned = line.strip()
+            if re.match(r"^\s*[०-९\d]+\s+.{6,250}[०-९\d]+\s*$", cleaned):
+                table_row_count += 1
+
+        is_toc = strong_match or structural_match or (table_row_count >= 3)
+        if is_toc:
+            toc_candidate_pages.append(page)
+            log.info(
+                "TOC candidate page=%s strong=%s structural=%s table_rows=%s",
+                page["page_num"],
+                strong_match,
+                structural_match,
+                table_row_count,
+            )
+
+        if len(toc_candidate_pages) >= max_candidates:
+            break
+
+    return toc_candidate_pages
 
 
 def build_segment_preview(all_pages: list[dict], page_from: int, page_to: int, max_chars: int = 1400) -> str:
@@ -841,18 +869,18 @@ def smooth_generic_ranges(items: list[dict]) -> list[dict]:
 
     smoothed = [dict(item) for item in items]
     for idx, item in enumerate(smoothed):
-        if item.get("title", "").lower() not in GENERIC_PARENT_NAMES:
+        if item.get("documentType", "").lower() not in GENERIC_PARENT_NAMES:
             continue
         prev_item = smoothed[idx - 1] if idx > 0 else None
         next_item = smoothed[idx + 1] if idx + 1 < len(smoothed) else None
-        prev_title = (prev_item or {}).get("title", "")
-        next_title = (next_item or {}).get("title", "")
+        prev_title = (prev_item or {}).get("documentType", "")
+        next_title = (next_item or {}).get("documentType", "")
         if prev_item and next_item and prev_title == next_title and prev_title.lower() not in GENERIC_PARENT_NAMES:
-            item["title"] = prev_title
+            item["documentType"] = prev_title
         elif prev_item and prev_title.lower() not in GENERIC_PARENT_NAMES and item.get("source") == "gap":
-            item["title"] = prev_title
+            item["documentType"] = prev_title
         elif next_item and next_title.lower() not in GENERIC_PARENT_NAMES and item.get("source") == "gap":
-            item["title"] = next_title
+            item["documentType"] = next_title
     return smoothed
 
 
@@ -866,9 +894,10 @@ def merge_adjacent_ranges(items: list[dict]) -> list[dict]:
         if (
             item.get("title") == prev.get("title")
             and item.get("pageFrom") == prev.get("pageTo", 0) + 1
+            and item.get("documentType") == prev.get("documentType")
         ):
             prev["pageTo"] = item["pageTo"]
-            prev["source"] = prev.get("source") if prev.get("source") != "gap" else item.get("source", prev.get("source"))
+            prev["verifiedPageTo"] = item.get("verifiedPageTo", item["pageTo"])
             if not prev.get("serialNo"):
                 prev["serialNo"] = item.get("serialNo", "")
             if not prev.get("courtFee"):
@@ -878,26 +907,112 @@ def merge_adjacent_ranges(items: list[dict]) -> list[dict]:
     return merged
 
 
+def verify_index_items_with_vectors(pdf_id: str, index_items: list[dict], all_pages: list[dict], search_k: int = 8) -> list[dict]:
+    if not index_items:
+        return []
+
+    try:
+        collection = chroma_client.get_collection(f"pdf_{pdf_id}")
+    except Exception:
+        return index_items
+
+    all_result = collection.get(include=["documents", "metadatas", "embeddings"])
+    rows = []
+    for doc_text, meta, emb in zip(
+        all_result.get("documents", []),
+        all_result.get("metadatas", []),
+        all_result.get("embeddings", []),
+    ):
+        rows.append({
+            "page_num": int(meta["page_num"]),
+            "text": doc_text or "",
+            "embedding": emb,
+        })
+
+    verified = []
+    for idx, item in enumerate(index_items):
+        raw_title = (item.get("displayTitle") or item.get("originalTitle") or item.get("title") or "").strip()
+        title_query = raw_title or item.get("title", "")
+        if not title_query:
+            verified.append(item)
+            continue
+
+        q_vec = embed_texts([title_query])[0]
+        scored = []
+        for row in rows:
+            lexical = lexical_overlap_score(title_query, row["text"])
+            semantic = sum(a * b for a, b in zip(q_vec, row["embedding"]))
+            score = (semantic * 2.0) + (lexical * 1.5)
+            scored.append((score, row["page_num"]))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_hits = [p for s, p in scored[:search_k] if s > 0.35]
+
+        toc_from = int(item.get("pageFrom", 1))
+        toc_to = int(item.get("pageTo", toc_from))
+        next_from = None
+        if idx + 1 < len(index_items):
+            next_from = int(index_items[idx + 1].get("pageFrom", toc_to + 1))
+
+        verified_from = toc_from
+        verified_to = toc_to
+        confidence = 0.55
+        verification_status = "toc_only"
+
+        if top_hits:
+            nearest = min(top_hits, key=lambda p: abs(p - toc_from))
+            if abs(nearest - toc_from) <= 2:
+                verified_from = nearest
+                verification_status = "verified"
+                confidence = 0.90
+            else:
+                verification_status = "weak_match"
+                confidence = 0.65
+
+        if next_from is not None and verified_from < next_from:
+            verified_to = max(verified_from, next_from - 1)
+        else:
+            verified_to = max(verified_from, toc_to)
+
+        verified.append({
+            **item,
+            "pageFrom": toc_from,
+            "pageTo": toc_to,
+            "verifiedPageFrom": verified_from,
+            "verifiedPageTo": verified_to,
+            "verificationStatus": verification_status,
+            "verificationConfidence": confidence,
+            "matchedPages": top_hits[:5],
+        })
+
+    return verified
+
+
 def classify_index_to_parent_documents(index_items: list[dict], all_pages: list[dict]) -> list[dict]:
-    """Restrict final index titles to the fixed parent document catalog only."""
     if not index_items or not PARENT_DOCUMENT_NAMES:
         return index_items
 
     classified = []
     for item in index_items:
-        raw_title = item.get("title", "")
-        preview = build_segment_preview(all_pages, item.get("pageFrom", 1), item.get("pageTo", 1))
+        raw_title = item.get("displayTitle") or item.get("originalTitle") or item.get("title", "")
+        preview = build_segment_preview(
+            all_pages,
+            item.get("verifiedPageFrom", item.get("pageFrom", 1)),
+            item.get("verifiedPageTo", item.get("pageTo", 1)),
+        )
         scored = score_parent_documents(raw_title, preview)
         candidates = shortlist_parent_documents(raw_title, preview)
-        title = choose_parent_document(raw_title, preview, candidates, scored)
+        document_type = choose_parent_document(raw_title, preview, candidates, scored)
+
         classified.append({
             **item,
-            "title": title,
-            "displayTitle": item.get("displayTitle") or raw_title or title,
-            "originalTitle": item.get("originalTitle") or raw_title or title,
+            "title": raw_title,
+            "displayTitle": raw_title,
+            "originalTitle": raw_title,
+            "documentType": document_type,
         })
-    return merge_adjacent_ranges(smooth_generic_ranges(classified))
 
+    return merge_adjacent_ranges(smooth_generic_ranges(classified))
 
 # ═════════════════════════════════════════════════════════════════════════════
 # REQUEST / RESPONSE MODELS
@@ -909,15 +1024,16 @@ class QueryRequest(BaseModel):
     top_k: int = 8
     current_page: Optional[int] = None
 
+
 class IndexRequest(BaseModel):
     pdf_id: str
+
 
 class NvidiaProxyRequest(BaseModel):
     model: str
     messages: list
     max_tokens: int = 2000
     temperature: float = 0.1
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ROUTES
@@ -934,7 +1050,6 @@ def health():
     }
 
 
-# ── 1. INGEST PDF ─────────────────────────────────────────────────────────────
 @app.post("/api/ingest")
 async def ingest_pdf(
     file: UploadFile = File(...),
@@ -942,9 +1057,9 @@ async def ingest_pdf(
     end_page: Optional[int] = Form(None),
 ):
     """
-    Stage 1 fast indexing pipeline.
-    Save the PDF, scan only the selected window, cache extracted pages,
-    vectorize that subset, and mark the rest for deferred ingestion.
+    Full-document ingestion pipeline.
+    OCR/extract all pages first, vectorize all pages, then index generation can safely
+    search TOC/index inside pages 1-10 while still verifying against the full document.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted")
@@ -952,7 +1067,7 @@ async def ingest_pdf(
     pdf_bytes = await file.read()
     pdf_id = pdf_id_from_bytes(pdf_bytes)
     stored_pdf_path(pdf_id).write_bytes(pdf_bytes)
-    log.info("Stage 1 ingest for PDF: %s  id=%s", file.filename, pdf_id)
+    log.info("Full ingest for PDF: %s id=%s", file.filename, pdf_id)
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = doc.page_count
@@ -960,71 +1075,54 @@ async def ingest_pdf(
         doc.close()
         raise HTTPException(400, "PDF has no pages")
 
-    start_page = max(1, min(start_page, total_pages))
-    default_end_page = min(total_pages, start_page + 4)
-    end_page = default_end_page if end_page is None else min(end_page, total_pages)
-    if start_page > end_page:
+    page_numbers = list(range(1, total_pages + 1))
+    try:
+        pages_data, stats = extract_pages_from_document(doc, page_numbers, total_pages, dpi=250)
+    finally:
         doc.close()
-        raise HTTPException(400, "Start page must be less than or equal to end page")
 
-    selected_page_numbers = list(range(start_page, end_page + 1))
-    pages_data, stats = extract_pages_from_document(doc, selected_page_numbers, total_pages, dpi=250)
-    doc.close()
-
-    replace_extracted_pages(pdf_id, pages_data, stage="fast_index")
+    replace_extracted_pages(pdf_id, pages_data, stage="full_ingestion")
     upsert_collection_pages(pdf_id, file.filename, pages_data, reset=True)
 
     indexed_pages = len(pages_data)
-    pending_pages = max(total_pages - indexed_pages, 0)
     upsert_pdf_record(
         pdf_id=pdf_id,
         filename=file.filename,
         total_pages=total_pages,
-        selected_start_page=start_page,
-        selected_end_page=end_page,
+        selected_start_page=1,
+        selected_end_page=min(10, total_pages),
         indexed_pages=indexed_pages,
-        status="toc_scanned",
-        retrieval_status="pending_deferred_ingestion" if pending_pages else "vectorized",
+        status="vectorized",
+        retrieval_status="vectorized",
         index_ready=False,
-        chat_ready=not bool(pending_pages),
-        pending_pages=pending_pages,
+        chat_ready=True,
+        pending_pages=0,
         index_source="",
     )
 
-    log.info(
-        "Stage 1 complete: indexed %s/%s pages, pending %s pages",
-        indexed_pages,
-        total_pages,
-        pending_pages,
-    )
     return {
         "pdf_id": pdf_id,
         "total_pages": total_pages,
         "indexed_pages": indexed_pages,
-        "indexed_page_start": start_page,
-        "indexed_page_end": end_page,
+        "indexed_page_start": 1,
+        "indexed_page_end": total_pages,
         "ocr_pages": stats["ocr_pages"],
         "vision_ocr_pages": stats["vision_ocr_pages"],
         "handwriting_suspected_pages": stats["handwriting_suspected_pages"],
         "digital_pages": stats["digital_pages"],
-        "status": "toc_scanned",
-        "retrieval_status": "pending_deferred_ingestion" if pending_pages else "vectorized",
-        "pending_pages": pending_pages,
-        "chat_ready": not bool(pending_pages),
+        "status": "vectorized",
+        "retrieval_status": "vectorized",
+        "pending_pages": 0,
+        "chat_ready": True,
         "filename": file.filename,
     }
 
 
-# -- 2. QUERY / CHATBOT ────────────────────────────────────────────────────────
 @app.post("/api/query")
 async def query_pdf(req: QueryRequest):
-    """
-    Answer a natural language question about the PDF using RAG.
-    Chat/search becomes fully available only after deferred ingestion completes.
-    """
     record = get_pdf_record(req.pdf_id)
     if record and not record.get("chat_ready"):
-        raise HTTPException(409, "Chat/search will be available after deferred ingestion finishes for this PDF.")
+        raise HTTPException(409, "Chat/search will be available after ingestion finishes for this PDF.")
 
     try:
         collection = chroma_client.get_collection(f"pdf_{req.pdf_id}")
@@ -1061,9 +1159,9 @@ async def query_pdf(req: QueryRequest):
         scored_rows.append({**row, "score": score})
 
     scored_rows.sort(key=lambda row: (row["score"], row["page_num"]), reverse=True)
-    top_rows = [row for row in scored_rows[: max(3, min(req.top_k, len(scored_rows)))] if row["score"] > 0]
+    top_rows = [row for row in scored_rows[:max(3, min(req.top_k, len(scored_rows)))] if row["score"] > 0]
     if not top_rows:
-        top_rows = scored_rows[: min(req.top_k, len(scored_rows))]
+        top_rows = scored_rows[:min(req.top_k, len(scored_rows))]
 
     context_parts = []
     page_refs = []
@@ -1104,288 +1202,142 @@ If the current page appears relevant, prioritize that page and its nearby pages.
     }
 
 
-# -- 3. GENERATE INDEX ─────────────────────────────────────────────────────────
 @app.post("/api/generate-index")
 async def generate_index(req: IndexRequest):
     """
-    Generate the structured document index from cached Stage 1 pages first.
-    If a TOC is detected, ranges are expanded deterministically across the whole PDF.
+    Generate structured index after full-document vectorization.
+    TOC/index discovery is restricted to pages 1-10.
+    Extracted TOC rows are then verified against the full vectorized PDF.
     """
     record = get_pdf_record(req.pdf_id)
-    all_pages = load_index_pages(req.pdf_id)
+    if not record:
+        raise HTTPException(404, f"PDF {req.pdf_id} metadata not found. Please ingest this PDF again.")
+
+    all_pages = load_all_pages_for_pdf(req.pdf_id)
     if not all_pages:
         raise HTTPException(404, f"PDF {req.pdf_id} not found. Please ingest first.")
 
     all_pages.sort(key=lambda item: item["page_num"])
-    indexed_start = all_pages[0]["page_num"]
-    indexed_end = all_pages[-1]["page_num"]
-    total_pages = record["total_pages"] if record else indexed_end
+    total_pages = record["total_pages"]
     total_chunks = len(all_pages)
 
-    # IMPROVED TOC CANDIDATE DETECTION
-    toc_candidate_pages = []
-    for page in all_pages:
-        text = page["text"]
-        lower_text = text.lower()
-
-        # STRONG INDICATORS: Direct mentions of index/contents
-        strong_match = bool(re.search(
-            r'\bindex\b(?!\s+(?:page|number))|'   # "INDEX" but not "INDEX PAGE"
-            r'\bcontents\b|'
-            r'of\s+contents|'
-            r'विषय\s*सूची|'                       # Hindi TOC
-            r'अनुक्रमणिका|'                       # Hindi Index
-            r'सूची',                              # Hindi List
-            lower_text,
-            re.IGNORECASE
-        ))
-
-        # STRUCTURAL INDICATORS: Table column headers
-        structural_match = bool(re.search(
-            r'sr\.?\s+no(?:\.)?|'
-            r'क्रम\s*\.|'
-            r'particulars?\s+of|'
-            r'page\s+no(?:\.)?(?:\s|$)|'
-            r'page\s+number|'
-            r'annexure|'
-            r'sheet\s+count',
-            lower_text,
-            re.IGNORECASE
-        ))
-
-        # TABLE STRUCTURE: Count rows that look like table entries
-        lines = text.split('\n')
-        table_row_count = 0
-        for line in lines:
-            # Patterns like: "1 Title 5" or Hindi digit equivalent
-            if re.match(r'^\s*[०-९\d]+\s+.{10,200}[०-९\d]+\s*$', line.strip()):
-                table_row_count += 1
-
-        is_toc = strong_match or structural_match or (table_row_count >= 3)
-
-        if is_toc:
-            toc_candidate_pages.append(page)
-            log.info(
-                f"📋 TOC detected on page {page['page_num']}: "
-                f"strong={strong_match}, structural={structural_match}, table_rows={table_row_count}"
-            )
-
-        if len(toc_candidate_pages) >= 8:
-            break
-
-    if toc_candidate_pages:
-        log.info(
-            f"Found {len(toc_candidate_pages)} candidate TOC pages: "
-            f"{[p['page_num'] for p in toc_candidate_pages]}"
-        )
-
+    toc_search_pages = get_toc_search_pages(all_pages, 1, min(10, total_pages))
+    toc_candidate_pages = detect_toc_candidate_pages(toc_search_pages, max_candidates=5)
     toc_page_nums = [p["page_num"] for p in toc_candidate_pages]
 
     index_items = []
     toc_source = ""
-    toc_range_end = total_pages if record else indexed_end
 
-    # TRY IMAGE EXTRACTION FIRST (most accurate for structured tables)
     if toc_page_nums:
-        log.info(f"→ Attempting image-based extraction from pages {toc_page_nums}...")
+        log.info("Attempting TOC image extraction from pages %s", toc_page_nums)
         toc_image_items = extract_toc_from_page_images(stored_pdf_path(req.pdf_id), toc_page_nums)
 
-        if isinstance(toc_image_items, list) and len(toc_image_items) >= 3:
+        if isinstance(toc_image_items, list) and len(toc_image_items) >= 2:
             index_items = build_toc_ranges_from_items(
-                toc_image_items, indexed_start, toc_range_end, "toc-image"
+                toc_image_items,
+                indexed_start=1,
+                range_end=total_pages,
+                default_source="toc-image",
             )
             toc_source = "toc-image"
-            log.info(
-                f"✓ SUCCESS: Extracted {len(index_items)} index items "
-                f"from structured TABLE OF CONTENTS"
-            )
 
-    # ONLY do OCR fallback if image extraction failed
     if not index_items and toc_candidate_pages:
-        log.info("⚠ Image extraction yielded no results, trying OCR text fallback...")
-
         toc_pages_text = ""
         for page in toc_candidate_pages:
             toc_pages_text += f"\n--- Page {page['page_num']} ---\n{page['text']}\n"
 
-        if toc_pages_text:
-            toc_prompt = f"""You are reading OCR text from a TABLE OF CONTENTS / INDEX page.
-These pages may contain a real table of contents for an Indian court file.
+        toc_prompt = f"""You are reading OCR text from an Indian court-file index/table-of-contents page.
 
-If a table of contents exists, extract the rows. Use both English and Hindi.
-Preserve original title text (do not translate Hindi).
-Read serial numbers and page numbers carefully.
-Convert Hindi digits to Arabic numerals.
-If one page number shown, set pageFrom and pageTo to same.
+Extract every table row in order.
+Preserve original Hindi/English title exactly.
+Convert Hindi digits to Arabic numerals only for page numbers.
+Return ONLY JSON array. Return [] if this is not a real TOC/index.
 
-Extracted text from pages {toc_page_nums}:
-{toc_pages_text[:8000]}
+Text:
+{toc_pages_text[:12000]}
 
-Return ONLY JSON (if not a TOC, return []):
+Format:
 [
   {{
     "serialNo": "1",
     "title": "exact original text",
     "pageFrom": 1,
-    "pageTo": 4,
+    "pageTo": 1,
     "source": "toc-ocr"
   }}
 ]"""
 
-            toc_raw = call_nvidia_text(
-                messages=[{"role": "user", "content": toc_prompt}],
-                max_tokens=3500,
+        toc_raw = call_nvidia_text(
+            messages=[{"role": "user", "content": toc_prompt}],
+            max_tokens=3500,
+            temperature=0.0,
+        )
+        toc_parsed = safe_json(toc_raw)
+        if isinstance(toc_parsed, list) and len(toc_parsed) >= 2:
+            index_items = build_toc_ranges_from_items(
+                toc_parsed,
+                indexed_start=1,
+                range_end=total_pages,
+                default_source="toc-ocr",
             )
-            toc_parsed = safe_json(toc_raw)
-            if isinstance(toc_parsed, list) and len(toc_parsed) >= 3:
-                index_items = build_toc_ranges_from_items(
-                    toc_parsed, indexed_start, toc_range_end, "toc-ocr"
-                )
-                toc_source = "toc-ocr"
-                log.info(f"✓ OCR fallback extracted {len(index_items)} items")
-
-    scan_chunk = 25
-    auto_items = []
-    uncovered_pages = all_pages if not index_items else []
+            toc_source = "toc-ocr"
 
     if not index_items:
-        log.info(f"⚠ No TOC found. Scanning {len(uncovered_pages)} pages for document boundaries...")
-
-        for i in range(0, len(uncovered_pages), scan_chunk):
-            chunk_pages = uncovered_pages[i:i + scan_chunk]
-            if not chunk_pages:
-                continue
-
-            page_texts = ""
-            for pg in chunk_pages:
-                preview = pg["text"][:300].replace("\n", " ").strip()
-                page_texts += f"Page {pg['page_num']}: {preview}\n"
-
-            from_page = chunk_pages[0]["page_num"]
-            to_page = chunk_pages[-1]["page_num"]
-
-            scan_prompt = f"""You are analyzing pages from an Indian court document.
-Below is extracted text from pages {from_page} to {to_page}.
-Each line shows the page number and a preview of its content.
-
-Identify each distinct document or section that STARTS within these pages.
-Look for: document titles, application headers, order headings, affidavit starts, annexure labels, etc.
-Text may be in Hindi (Devanagari), English, or mixed - preserve it exactly.
-
-Page content:
-{page_texts}
-
-Return ONLY a valid JSON array (empty [] if nothing found):
-[
-  {{
-    "title": "exact title as it appears on the page - original language",
-    "pageFrom": {from_page},
-    "pageTo": {to_page},
-    "source": "auto"
-  }}
-]"""
-
-            raw = call_nvidia_text(
-                messages=[{"role": "user", "content": scan_prompt}],
-                max_tokens=2000,
-            )
-            parsed = safe_json(raw)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if item.get("title") and len(item["title"]) > 2:
-                        auto_items.append({
-                            **item,
-                            "pageFrom": max(from_page, coerce_page_number(item.get("pageFrom"), from_page)),
-                            "pageTo": min(to_page, coerce_page_number(item.get("pageTo"), to_page)),
-                            "source": "auto",
-                        })
-    else:
-        log.info("✓ Using TOC-based index (skipping auto-scan)")
-
-    all_items = index_items + auto_items
-    all_items.sort(key=lambda item: item.get("pageFrom", 0))
-
-    final = []
-    cursor = indexed_start
-    final_range_end = total_pages if index_items else indexed_end
-
-    for item in all_items:
-        pf = coerce_page_number(item.get("pageFrom"), cursor)
-        pt = coerce_page_number(item.get("pageTo"), pf)
-        if pt < pf:
-            pt = pf
-
-        if pf > cursor:
-            final.append({
-                "title": f"Pages {cursor}-{pf - 1}",
-                "displayTitle": f"Pages {cursor}-{pf - 1}",
-                "originalTitle": f"Pages {cursor}-{pf - 1}",
-                "pageFrom": cursor,
-                "pageTo": pf - 1,
-                "source": "gap",
-                "serialNo": "",
-                "courtFee": "",
-            })
-
-        if pf >= cursor:
-            final.append({
-                "title": item.get("title", f"Pages {pf}-{pt}"),
-                "displayTitle": item.get("displayTitle") or item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
-                "originalTitle": item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
-                "pageFrom": pf,
-                "pageTo": pt,
-                "source": item.get("source", "auto"),
-                "serialNo": str(item.get("serialNo", "")),
-                "courtFee": str(item.get("courtFee", "")),
-            })
-            cursor = pt + 1
-
-    if cursor <= final_range_end:
-        final.append({
-            "title": f"Pages {cursor}-{final_range_end}",
-            "displayTitle": f"Pages {cursor}-{final_range_end}",
-            "originalTitle": f"Pages {cursor}-{final_range_end}",
-            "pageFrom": cursor,
-            "pageTo": final_range_end,
-            "source": "gap",
-            "serialNo": "",
-            "courtFee": "",
-        })
-
-    classified_final = classify_index_to_parent_documents(final, all_pages)
-    index_source = toc_source or ("toc" if index_items else "auto")
-
-    log.info(f"📊 Final index: {len(classified_final)} items from source '{index_source}'")
-
-    if record:
-        update_pdf_record(
-            req.pdf_id,
-            status="index_ready",
-            index_ready=True,
-            index_source=index_source,
+        raise HTTPException(
+            422,
+            "No usable table of contents/index found in pages 1-10. Please review PDF or run manual indexing."
         )
-        record = get_pdf_record(req.pdf_id)
+
+    verified_items = verify_index_items_with_vectors(req.pdf_id, index_items, all_pages)
+    classified_final = classify_index_to_parent_documents(verified_items, all_pages)
+    index_source = toc_source or "toc"
+    save_index(req.pdf_id, classified_final)
+    update_pdf_record(
+        req.pdf_id,
+        status="index_ready",
+        index_ready=True,
+        index_source=index_source,
+    )
+    record = get_pdf_record(req.pdf_id)
 
     return {
         "index": classified_final,
         "total_pages": total_pages,
-        "indexed_page_start": indexed_start,
-        "indexed_page_end": indexed_end,
+        "indexed_page_start": 1,
+        "indexed_page_end": total_pages,
         "indexed_pages": total_chunks,
+        "toc_search_window": [1, min(10, total_pages)],
+        "toc_candidate_pages": toc_page_nums,
         "toc_items": len(index_items),
-        "auto_items": len(auto_items),
+        "auto_items": 0,
         "index_source": index_source,
-        "status": record["status"] if record else "index_ready",
-        "retrieval_status": record["retrieval_status"] if record else "legacy",
-        "pending_pages": record["pending_pages"] if record else max(total_pages - total_chunks, 0),
-        "chat_ready": record["chat_ready"] if record else True,
+        "status": record["status"],
+        "retrieval_status": record["retrieval_status"],
+        "pending_pages": record["pending_pages"],
+        "chat_ready": record["chat_ready"],
     }
 
+@app.get("/api/index/{pdf_id}")
+async def get_saved_index_route(pdf_id: str):
+    record = get_pdf_record(pdf_id)
+    if not record:
+        raise HTTPException(404, f"PDF {pdf_id} not found")
 
-# -- 4. GET PAGE TEXT ──────────────────────────────────────────────────────────
+    saved = get_saved_index(pdf_id)
+    if saved is None:
+        raise HTTPException(404, f"No saved index found for PDF {pdf_id}")
+
+    return {
+        "pdf_id": pdf_id,
+        "filename": record.get("filename", ""),
+        "index": saved,
+        "total_entries": len(saved),
+        "index_ready": record.get("index_ready", False),
+        "index_source": record.get("index_source", ""),
+    }
+
 @app.get("/api/page-text/{pdf_id}/{page_num}")
 async def get_page_text(pdf_id: str, page_num: int):
-    """Get the stored text for a specific page."""
     cached = get_cached_pages(pdf_id, start_page=page_num, end_page=page_num)
     if cached:
         page = cached[0]
@@ -1421,17 +1373,13 @@ async def get_page_text(pdf_id: str, page_num: int):
     }
 
 
-# -- 5. LIST INGESTED PDFs ─────────────────────────────────────────────────────
 @app.get("/api/pdfs")
 async def list_pdfs():
-    """List PDFs from the workflow state store."""
     return {"pdfs": list_pdf_records()}
-
 
 
 @app.get("/api/queues")
 async def get_queues():
-    """Compatibility endpoint for frontend queue polling when runner APIs are not enabled."""
     return {
         "index_ready": [],
         "stage1_batch": [],
@@ -1496,8 +1444,8 @@ async def get_queues():
 
 @app.get("/api/batch-reports")
 async def get_batch_reports(limit: int = 8):
-    """Compatibility endpoint for frontend batch report polling."""
     return {"reports": [], "limit": max(1, min(limit, 100))}
+
 
 @app.get("/api/pdf-status/{pdf_id}")
 async def get_pdf_status(pdf_id: str):
@@ -1513,55 +1461,23 @@ async def process_pending_pdf(pdf_id: str):
     if not record:
         raise HTTPException(404, f"PDF {pdf_id} not found")
 
-    cached_pages = get_cached_pages(pdf_id)
-    cached_page_numbers = {page["page_num"] for page in cached_pages}
-    pending_page_numbers = [page for page in range(1, record["total_pages"] + 1) if page not in cached_page_numbers]
-    if not pending_page_numbers:
-        update_pdf_record(pdf_id, status="vectorized", retrieval_status="vectorized", chat_ready=True, pending_pages=0)
-        return {
-            "pdf_id": pdf_id,
-            "status": "vectorized",
-            "retrieval_status": "vectorized",
-            "pending_pages": 0,
-            "processed_pages": 0,
-            "chat_ready": True,
-        }
-
-    pdf_path = stored_pdf_path(pdf_id)
-    if not pdf_path.exists():
-        raise HTTPException(404, f"Stored PDF for {pdf_id} not found")
-
-    update_pdf_record(pdf_id, status="full_ingestion_running", retrieval_status="full_ingestion_running")
-    doc = fitz.open(pdf_path)
-    try:
-        pages_data, stats = extract_pages_from_document(doc, pending_page_numbers, record["total_pages"], dpi=250)
-    finally:
-        doc.close()
-
-    upsert_extracted_pages(pdf_id, pages_data, stage="deferred_ingestion")
-    upsert_collection_pages(pdf_id, record["filename"], pages_data, reset=False)
-
-    updated_indexed_pages = len(get_cached_pages(pdf_id))
     update_pdf_record(
         pdf_id,
-        indexed_pages=updated_indexed_pages,
         status="vectorized",
         retrieval_status="vectorized",
         chat_ready=True,
         pending_pages=0,
     )
 
+    updated = get_pdf_record(pdf_id)
     return {
         "pdf_id": pdf_id,
-        "status": "vectorized",
-        "retrieval_status": "vectorized",
-        "pending_pages": 0,
-        "processed_pages": len(pages_data),
-        "indexed_pages": updated_indexed_pages,
-        "ocr_pages": stats["ocr_pages"],
-        "vision_ocr_pages": stats["vision_ocr_pages"],
-        "handwriting_suspected_pages": stats["handwriting_suspected_pages"],
-        "chat_ready": True,
+        "status": updated["status"],
+        "retrieval_status": updated["retrieval_status"],
+        "pending_pages": updated["pending_pages"],
+        "processed_pages": 0,
+        "indexed_pages": updated["indexed_pages"],
+        "chat_ready": updated["chat_ready"],
     }
 
 
@@ -1573,10 +1489,8 @@ async def process_pending_batch():
     return {"processed": results, "count": len(results)}
 
 
-# -- 6. DELETE PDF ─────────────────────────────────────────────────────────────
 @app.delete("/api/pdfs/{pdf_id}")
 async def delete_pdf(pdf_id: str):
-    """Remove a PDF and all its vectors from the database."""
     try:
         chroma_client.delete_collection(f"pdf_{pdf_id}")
         delete_pdf_state(pdf_id)
@@ -1590,44 +1504,37 @@ async def delete_pdf(pdf_id: str):
         raise HTTPException(404, f"PDF {pdf_id} not found")
 
 
-# ── 7. NVIDIA PROXY (for vision calls from frontend) ─────────────────────────
 @app.post("/api/nvidia-proxy")
 async def nvidia_proxy(req: NvidiaProxyRequest):
-    """
-    Proxy for NVIDIA API calls from the frontend.
-    Adds the API key server-side so it never goes to the browser.
-    """
     headers = {
         "Content-Type": "application/json",
     }
     if NVIDIA_API_KEY:
         headers["Authorization"] = f"Bearer {NVIDIA_API_KEY}"
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{NVIDIA_BASE_URL}/chat/completions",
             headers=headers,
-
             json={
-                "model":       req.model,
-                "messages":    req.messages,
-                "max_tokens":  req.max_tokens,
+                "model": req.model,
+                "messages": req.messages,
+                "max_tokens": req.max_tokens,
                 "temperature": req.temperature,
             },
         )
+
     if not resp.is_success:
         raise HTTPException(resp.status_code, resp.text)
     return resp.json()
 
 
-# ── STARTUP ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
     if not MODEL_API_READY:
         log.warning("Model API credentials are not configured for the default NVIDIA endpoint - AI features will fail")
-    log.info(f"Vision model : {VISION_MODEL}")
-    log.info(f"Text model   : {TEXT_MODEL}")
-    log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
+    log.info("Vision model : %s", VISION_MODEL)
+    log.info("Text model   : %s", TEXT_MODEL)
+    log.info("ChromaDB path: %s", CHROMA_DB_PATH)
     log.info("Server ready")
-
-
