@@ -1,5 +1,5 @@
-"""
-Court File Indexer — RAG Backend  (v5.0 — Full Local Pipeline)
+﻿"""
+Court File Indexer â€” RAG Backend  (v5.0 â€” Full Local Pipeline)
 ==============================================================
 
 Environment (.env):
@@ -15,23 +15,23 @@ Environment (.env):
   DATABASE_URL                    = postgresql://postgres:post123@localhost:5432/court_rag
   WORKFLOW_SQLITE_PATH            = ./workflow.db
 
-Pipeline (100 % local — no cloud, no NVIDIA API):
+Pipeline (100 % local â€” no cloud, no NVIDIA API):
   Upload PDF
-    → OCR every page   (PyMuPDF direct → Tesseract → qwen2.5vl if handwritten)
-    → Vectorize pages  (sentence-transformers  →  ChromaDB)
-    → Persist text     (PostgreSQL via workflow_state.py)
+    â†’ OCR every page   (PyMuPDF direct â†’ Tesseract â†’ qwen2.5vl if handwritten)
+    â†’ Vectorize pages  (sentence-transformers  â†’  ChromaDB)
+    â†’ Persist text     (PostgreSQL via workflow_state.py)
 
-  Generate Index   ← pure local, no LLM at all
-    → Detect TOC in pages 1-10          (tight regex heuristics)
-    → Parse TOC rows                     (regex, two-pass)
-    → Build / forward-fill page ranges
-    → Verify with full-doc vectors       (local embeddings)
-    → Classify document types            (alias map + local embeddings)
-    → Save to DB + export JSON
+  Generate Index   â† pure local, no LLM at all
+    â†’ Detect TOC in pages 1-10          (tight regex heuristics)
+    â†’ Parse TOC rows                     (regex, two-pass)
+    â†’ Build / forward-fill page ranges
+    â†’ Verify with full-doc vectors       (local embeddings)
+    â†’ Classify document types            (alias map + local embeddings)
+    â†’ Save to DB + export JSON
 
   Chat / Query
-    → Hybrid retrieval  (semantic + lexical + proximity)
-    → qwen2.5:14b answer generation  (local Ollama)
+    â†’ Hybrid retrieval  (semantic + lexical + proximity)
+    â†’ qwen2.5:14b answer generation  (local Ollama)
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ from workflow_state import (
     build_queue_snapshot,
 )
 
-# ── Bootstrap ──────────────────────────────────────────────────────────────────
+# â”€â”€ Bootstrap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
@@ -86,7 +86,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── HF cache ───────────────────────────────────────────────────────────────────
+# â”€â”€ HF cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 HF_CACHE_ROOT = (
     Path(os.getenv("LOCALAPPDATA") or tempfile.gettempdir()) / "court-rag-hf-cache"
 )
@@ -96,13 +96,13 @@ for _k in ("HF_HOME", "TRANSFORMERS_CACHE", "SENTENCE_TRANSFORMERS_HOME"):
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 Path(HF_CACHE_PATH).mkdir(parents=True, exist_ok=True)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 CHROMA_DB_PATH    = os.getenv("CHROMA_DB_PATH",    "./chroma_db")
 PDF_STORAGE_PATH  = os.getenv("PDF_STORAGE_PATH",  "./stored_pdfs")
 INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
 TESSERACT_LANG    = os.getenv("TESSERACT_LANG",    "hin+eng")
 
-# Ollama endpoint — /v1 appended automatically if missing
+# Ollama endpoint â€” /v1 appended automatically if missing
 _RAW_BASE          = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 LOCAL_LLM_BASE_URL = _RAW_BASE if _RAW_BASE.endswith("/v1") else f"{_RAW_BASE}/v1"
 LOCAL_TEXT_MODEL   = os.getenv("LOCAL_TEXT_MODEL",   "qwen2.5:14b")
@@ -127,27 +127,27 @@ PARENT_DOCUMENT_NAMES: list[str] = list(
 GENERIC_PARENT_NAMES  = {"other", "others"}
 _PARENT_EMBEDDINGS: Optional[list] = None
 
-# ── Storage dirs ───────────────────────────────────────────────────────────────
+# â”€â”€ Storage dirs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 for _d in (CHROMA_DB_PATH, PDF_STORAGE_PATH, INDEX_EXPORT_PATH):
     Path(_d).mkdir(parents=True, exist_ok=True)
 
-# ── ChromaDB ───────────────────────────────────────────────────────────────────
+# â”€â”€ ChromaDB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_DB_PATH,
     settings=Settings(anonymized_telemetry=False),
 )
 
-# ── Ollama clients (OpenAI-compatible) ────────────────────────────────────────
+# â”€â”€ Ollama clients (OpenAI-compatible) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _http = httpx.Client(timeout=LOCAL_LLM_TIMEOUT)
 
 _text_client   = OpenAI(base_url=LOCAL_LLM_BASE_URL, api_key="ollama", http_client=_http)
 _vision_client = OpenAI(base_url=LOCAL_LLM_BASE_URL, api_key="ollama", http_client=_http)
 
-# ── Embedding model ────────────────────────────────────────────────────────────
+# â”€â”€ Embedding model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _embedder      = None
 _embedder_lock = Lock()
 
-# ── FastAPI ────────────────────────────────────────────────────────────────────
+# â”€â”€ FastAPI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app = FastAPI(title="Court File Indexer API", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -157,9 +157,9 @@ app.add_middleware(
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # EMBEDDING
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def get_embedder():
     global _embedder
@@ -168,7 +168,7 @@ def get_embedder():
             if _embedder is None:
                 try:
                     from sentence_transformers import SentenceTransformer
-                    log.info("Loading embedding model …")
+                    log.info("Loading embedding model â€¦")
                     _embedder = SentenceTransformer(
                         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                         cache_folder=HF_CACHE_PATH,
@@ -200,14 +200,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return model.encode(texts, show_progress_bar=False, normalize_embeddings=True).tolist()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # LOCAL LLM CALLS
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def call_text_llm(
     messages: list[dict], max_tokens: int = 2000, temperature: float = 0.1
 ) -> str:
-    """qwen2.5:14b — used ONLY for /api/query chat answers."""
+    """qwen2.5:14b â€” used ONLY for /api/query chat answers."""
     try:
         resp = _text_client.chat.completions.create(
             model=LOCAL_TEXT_MODEL,
@@ -223,7 +223,7 @@ def call_text_llm(
 
 def call_vision_llm(image_b64: str, prompt: str, max_tokens: int = 2200) -> str:
     """
-    qwen2.5vl:7b — used ONLY during ingestion for handwritten / poor-OCR pages.
+    qwen2.5vl:7b â€” used ONLY during ingestion for handwritten / poor-OCR pages.
     Never called during index generation.
     """
     try:
@@ -248,9 +248,9 @@ def call_vision_llm(image_b64: str, prompt: str, max_tokens: int = 2200) -> str:
         return ""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PDF / OCR / IMAGE HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def pdf_id_from_bytes(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()[:16]
@@ -278,10 +278,10 @@ def image_to_jpeg_b64(img: Image.Image, max_side: int = 1800, quality: int = 80)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def ocr_page_image(image: Image.Image) -> str:
+def ocr_page_image(image: Image.Image, psm: int = 6) -> str:
     try:
         return pytesseract.image_to_string(
-            image, lang=TESSERACT_LANG, config="--psm 6"
+            image, lang=TESSERACT_LANG, config=f"--psm {int(psm)}"
         ).strip()
     except Exception as exc:
         log.warning("Tesseract OCR failed: %s", exc)
@@ -365,7 +365,7 @@ def extract_page_content(page: fitz.Page, page_num: int, dpi: int = 250) -> dict
                 vision_used = True
 
     return {
-        "text":                  ocr_text or f"[Page {page_num} — no readable text]",
+        "text":                  ocr_text or f"[Page {page_num} â€” no readable text]",
         "used_ocr":              True,
         "vision_used":           vision_used,
         "handwriting_suspected": handwriting_suspected,
@@ -384,7 +384,7 @@ def extract_pages_from_document(
 
     for pn in page_numbers:
         pd   = extract_page_content(doc[pn - 1], pn, dpi=dpi)
-        text = pd["text"] or f"[Page {pn} — no readable text]"
+        text = pd["text"] or f"[Page {pn} â€” no readable text]"
         if pd["used_ocr"]:   ocr_n    += 1
         if pd["vision_used"]:vision_n += 1
         if pd["handwriting_suspected"]: hw_n += 1
@@ -396,7 +396,7 @@ def extract_pages_from_document(
             "extraction_method":     pd["extraction_method"],
         })
         log.info(
-            "Page %s/%s — %-12s — %s chars",
+            "Page %s/%s â€” %-12s â€” %s chars",
             pn, total_pages, pd["extraction_method"], len(text),
         )
 
@@ -408,9 +408,9 @@ def extract_pages_from_document(
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # CHROMA
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def get_or_create_collection(pdf_id: str):
     name = f"pdf_{pdf_id}"
@@ -478,9 +478,9 @@ def load_all_pages_for_pdf(pdf_id: str) -> list[dict]:
     return cached
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOC DETECTION  —  pure local regex, NO LLM
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TOC DETECTION  â€”  pure local regex, NO LLM
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _DEVA_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
 
@@ -515,49 +515,400 @@ _TABLE_ROW_RE = re.compile(
 )
 
 
+_TOC_HEADER_HINTS = (
+    "index",
+    "table of contents",
+    "toc",
+    "chronology",
+    "chronology of events",
+    "list of documents",
+    "index & chronology",
+    "\u0935\u093f\u0937\u092f",
+    "\u0938\u0942\u091a\u0940",
+    "\u0905\u0928\u0941\u0915\u094d\u0930\u092e\u0923\u093f\u0915\u093e",
+)
+
+_TOC_STRUCT_HINTS = (
+    "sr",
+    "serial",
+    "particular",
+    "annexure",
+    "page",
+    "pg",
+    "sheet",
+    "document",
+    "\u0915\u094d\u0930\u092e",
+    "\u0926\u0938\u094d\u0924\u093e\u0935\u0947\u091c",
+    "\u0905\u0928\u0941\u0932\u0917\u094d\u0928",
+)
+
+_TOC_SEED_TEXTS = [
+    "Table of contents with serial number particulars annexure and page number",
+    "Index page listing documents and page ranges for a court file",
+    "Index and chronology of events",
+    "\u0928\u094d\u092f\u093e\u092f\u093e\u0932\u092f \u092a\u094d\u0930\u0915\u0930\u0923 \u0915\u0940 \u0935\u093f\u0937\u092f \u0938\u0942\u091a\u0940 \u091c\u093f\u0938\u092e\u0947\u0902 \u0915\u094d\u0930\u092e \u0938\u0902\u0916\u094d\u092f\u093e \u0926\u0938\u094d\u0924\u093e\u0935\u0947\u091c \u0914\u0930 \u092a\u0943\u0937\u094d\u0920 \u0938\u0902\u0916\u094d\u092f\u093e \u0926\u093f\u090f \u0939\u094b\u0902",
+]
+_TOC_SEED_EMBEDDINGS: Optional[list[list[float]]] = None
+
+_SERIAL_START_RE = re.compile(r"^\s*(?P<serial>[०-९\d]{1,4})[\.\)\/:-]?\s+(?P<body>.+)$")
+_PAGE_TAIL_RE = re.compile(
+    r"(?P<page>\d{1,4}(?:\s*(?:-|to)\s*\d{1,4})?/?)(?:\s*)$",
+    re.IGNORECASE,
+)
+_OCR_CHAR_FIX = str.maketrans({
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2212": "-",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+})
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return 0.0
+    return float(sum(x * y for x, y in zip(a, b)))
+
+
+def _get_toc_seed_embeddings() -> list[list[float]]:
+    global _TOC_SEED_EMBEDDINGS
+    if _TOC_SEED_EMBEDDINGS is None:
+        _TOC_SEED_EMBEDDINGS = embed_texts(_TOC_SEED_TEXTS)
+    return _TOC_SEED_EMBEDDINGS
+
+
+def _normalize_toc_line(line: str) -> str:
+    line = _to_arabic((line or "").translate(_OCR_CHAR_FIX))
+    line = re.sub(r"\s+", " ", line).strip()
+    line = re.sub(r"\b(?:t0|t0o)\b", "to", line, flags=re.IGNORECASE)
+    return line
+
+
+def _extract_toc_row_from_line(line: str, fallback_page: int = 1) -> Optional[dict]:
+    line = _normalize_toc_line(line)
+    if not line or _SKIP_LINE_RE.match(line):
+        return None
+
+    serial = ""
+    body = line
+    sm = _SERIAL_START_RE.match(line)
+    if sm:
+        serial = _to_arabic(sm.group("serial").strip())
+        body = sm.group("body").strip()
+
+    pm = _PAGE_TAIL_RE.search(body)
+    if not pm:
+        return None
+
+    page_s = pm.group("page").strip().rstrip("/")
+    title_part = body[: pm.start()].strip(" .:-")
+    if len(title_part) < 2:
+        return None
+
+    annexure = ""
+    ann_m = _ANNEXURE_RE.search(title_part)
+    if ann_m:
+        annexure = ann_m.group(0).strip()
+        title_part = (title_part[: ann_m.start()] + title_part[ann_m.end() :]).strip()
+
+    if len(title_part) < 2:
+        return None
+
+    pf, pt = _parse_page_range(page_s, fallback_page)
+    return {
+        "serialNo": serial,
+        "title": title_part,
+        "annexure": annexure,
+        "pageFrom": pf,
+        "pageTo": pt,
+        "source": "toc-stitch",
+    }
+
+
+def _parse_stitched_toc_rows(text: str, fallback_page: int = 1) -> list[dict]:
+    lines = [_normalize_toc_line(l) for l in (text or "").splitlines()]
+    lines = [l for l in lines if l]
+    if not lines:
+        return []
+
+    stitched: list[str] = []
+    cur = ""
+    for line in lines:
+        if _SERIAL_START_RE.match(line):
+            if cur:
+                stitched.append(cur.strip())
+            cur = line
+            continue
+        if cur:
+            cur = f"{cur} {line}".strip()
+        else:
+            stitched.append(line)
+    if cur:
+        stitched.append(cur.strip())
+
+    rows: list[dict] = []
+    for line in stitched:
+        row = _extract_toc_row_from_line(line, fallback_page=fallback_page)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _parse_json_list(payload: str) -> list[dict]:
+    if not payload:
+        return []
+    payload = payload.strip()
+    m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", payload, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        payload = m.group(1)
+    else:
+        m = re.search(r"(\[.*\])", payload, flags=re.DOTALL)
+        if m:
+            payload = m.group(1)
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        pf, pt = _parse_page_range(str(item.get("pageFrom", item.get("page", ""))), 1)
+        if "pageTo" in item:
+            _, pt2 = _parse_page_range(str(item.get("pageTo", "")), pt)
+            pt = max(pf, pt2)
+        out.append({
+            "serialNo": str(item.get("serialNo", "")).strip(),
+            "title": title,
+            "annexure": str(item.get("annexure", "")).strip(),
+            "pageFrom": pf,
+            "pageTo": pt,
+            "source": "toc-llm-json",
+        })
+    return out
+
+
+def _toc_rows_from_local_llm(text: str, fallback_page: int = 1) -> list[dict]:
+    prompt = (
+        "Extract only table-of-contents/index rows from this OCR text. "
+        "Return strict JSON array only, no prose. "
+        "Schema for each row: "
+        '{"serialNo":"", "title":"", "annexure":"", "pageFrom":1, "pageTo":1}. '
+        "If not found, return [].\n\n"
+        f"Text:\n{text[:9000]}"
+    )
+    raw = call_text_llm(
+        [{"role": "user", "content": prompt}],
+        max_tokens=1400,
+        temperature=0.0,
+    )
+    rows = _parse_json_list(raw)
+    if not rows:
+        return []
+    for row in rows:
+        row["pageFrom"] = max(1, _coerce_int(row.get("pageFrom"), fallback_page))
+        row["pageTo"] = max(row["pageFrom"], _coerce_int(row.get("pageTo"), row["pageFrom"]))
+    return rows
+
+
+def _toc_rows_from_vision_llm(image: Image.Image, fallback_page: int = 1) -> list[dict]:
+    if not ENABLE_VISION:
+        return []
+    prompt = (
+        "This is a possible court-file index/table-of-contents page. "
+        "Extract rows and return strict JSON array only, no prose. "
+        "Schema: "
+        '[{"serialNo":"", "title":"", "annexure":"", "pageFrom":1, "pageTo":1}]. '
+        "Accept page ranges and normalize numerals."
+    )
+    raw = call_vision_llm(image_to_jpeg_b64(image), prompt, max_tokens=1400)
+    rows = _parse_json_list(raw)
+    if not rows:
+        return []
+    for row in rows:
+        row["pageFrom"] = max(1, _coerce_int(row.get("pageFrom"), fallback_page))
+        row["pageTo"] = max(row["pageFrom"], _coerce_int(row.get("pageTo"), row["pageFrom"]))
+    return rows
+
+
+def _extract_toc_ocr_text_from_pdf(pdf_id: str, page_num: int, psm: int = 6) -> str:
+    pdf_path = stored_pdf_path(pdf_id)
+    if not pdf_path.exists():
+        return ""
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if page_num < 1 or page_num > doc.page_count:
+                return ""
+            img = render_page_image(doc[page_num - 1], dpi=300)
+        finally:
+            doc.close()
+        return ocr_page_image(img, psm=psm)
+    except Exception as exc:
+        log.warning("TOC OCR fallback failed for p=%s: %s", page_num, exc)
+        return ""
+
+
 def detect_toc_candidate_pages(pages: list[dict], max_candidates: int = 5) -> list[dict]:
     """
-    Return pages from pages 1-10 that contain a genuine index/TOC table.
-    Requires: strong header  OR  (structural col header + ≥3 table-body rows).
-    Tighter than v3 — avoids false positives on cover/form pages.
+    Hybrid TOC candidate ranking:
+      - header keywords
+      - structural keywords
+      - row-shape count
+      - embedding similarity against TOC seed prompts
     """
-    candidates: list[dict] = []
-    for page in pages:
-        text     = page.get("text", "") or ""
-        strong   = bool(_STRONG_HEADER_RE.search(text))
-        struct   = bool(_STRUCTURAL_RE.search(text))
-        row_hits = sum(1 for ln in text.splitlines() if _TABLE_ROW_RE.match(ln))
-        is_toc   = strong or (struct and row_hits >= 3)
-        if is_toc:
-            candidates.append(page)
-            log.info(
-                "TOC candidate p=%s  strong=%s  struct=%s  rows=%s",
-                page["page_num"], strong, struct, row_hits,
+    if not pages:
+        return []
+
+    texts = [(_to_arabic((p.get("text", "") or "")[:12000])) for p in pages]
+    page_embeddings: list[list[float]] = []
+    seed_embeddings: list[list[float]] = []
+    try:
+        page_embeddings = embed_texts(texts)
+        seed_embeddings = _get_toc_seed_embeddings()
+    except Exception as exc:
+        log.warning("TOC embedding scoring unavailable: %s", exc)
+
+    ranked: list[tuple[float, dict, dict]] = []
+    for idx, page in enumerate(pages):
+        text = texts[idx]
+        low = text.lower()
+        strong = bool(_STRONG_HEADER_RE.search(text))
+        struct = bool(_STRUCTURAL_RE.search(text))
+        header_hits = sum(1 for kw in _TOC_HEADER_HINTS if kw in low)
+        struct_hits = sum(1 for kw in _TOC_STRUCT_HINTS if kw in low)
+        row_hits = sum(1 for ln in text.splitlines() if _TABLE_ROW_RE.match(ln.strip()))
+
+        emb_score = 0.0
+        if idx < len(page_embeddings) and seed_embeddings:
+            emb_score = max(
+                (_cosine_similarity(page_embeddings[idx], seed) for seed in seed_embeddings),
+                default=0.0,
             )
-        if len(candidates) >= max_candidates:
-            break
+
+        score = (
+            (3.5 if strong else 0.0)
+            + (2.0 if struct else 0.0)
+            + min(header_hits, 4) * 1.5
+            + min(struct_hits, 6) * 0.7
+            + min(row_hits, 8) * 1.0
+            + max(0.0, emb_score) * 4.0
+        )
+        dbg = {
+            "strong": strong,
+            "struct": struct,
+            "header_hits": header_hits,
+            "struct_hits": struct_hits,
+            "row_hits": row_hits,
+            "emb": round(emb_score, 4),
+            "score": round(score, 3),
+        }
+        ranked.append((score, page, dbg))
+
+    ranked.sort(key=lambda x: (x[0], x[1].get("page_num", 0)), reverse=True)
+    candidates = [page for _score, page, _dbg in ranked[: max(1, max_candidates)]]
+
+    for _score, page, dbg in ranked[: min(len(ranked), max(8, max_candidates))]:
+        log.info("TOC score p=%s -> %s", page.get("page_num"), dbg)
+
     return candidates
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOC ROW PARSING  —  two-pass regex, NO LLM
-# ══════════════════════════════════════════════════════════════════════════════
+def expand_toc_candidate_pages(
+    candidates: list[dict],
+    all_pages: list[dict],
+    next_offsets: tuple[int, ...] = (1, 2),
+) -> list[dict]:
+    page_map = {int(p["page_num"]): p for p in all_pages}
+    selected: set[int] = set()
+    for page in candidates:
+        pn = int(page["page_num"])
+        selected.add(pn)
+        selected.add(max(1, pn - 1))
+        for off in next_offsets:
+            selected.add(pn + int(off))
+    return [page_map[pn] for pn in sorted(selected) if pn in page_map]
+
+
+def _load_pdf_page_image(pdf_id: str, page_num: int, dpi: int = 300) -> Optional[Image.Image]:
+    pdf_path = stored_pdf_path(pdf_id)
+    if not pdf_path.exists():
+        return None
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if page_num < 1 or page_num > doc.page_count:
+                return None
+            return render_page_image(doc[page_num - 1], dpi=dpi)
+        finally:
+            doc.close()
+    except Exception as exc:
+        log.warning("Failed loading page image for TOC fallback p=%s: %s", page_num, exc)
+        return None
+
+
+def extract_toc_rows_with_fallback(pdf_id: str, page: dict) -> tuple[list[dict], str]:
+    page_num = int(page["page_num"])
+    base_text = page.get("text", "") or ""
+    best_rows = parse_toc_rows_hybrid(base_text, fallback_page=page_num)
+    best_method = "cached-hybrid"
+    best_text = base_text
+
+    if len(best_rows) < 2:
+        ocr6 = _extract_toc_ocr_text_from_pdf(pdf_id, page_num, psm=6)
+        if ocr6:
+            rows6 = parse_toc_rows_hybrid(ocr6, fallback_page=page_num)
+            if len(rows6) > len(best_rows):
+                best_rows, best_method, best_text = rows6, "toc-ocr-psm6", ocr6
+
+    if len(best_rows) < 2:
+        ocr11 = _extract_toc_ocr_text_from_pdf(pdf_id, page_num, psm=11)
+        if ocr11:
+            rows11 = parse_toc_rows_hybrid(ocr11, fallback_page=page_num)
+            if len(rows11) > len(best_rows):
+                best_rows, best_method, best_text = rows11, "toc-ocr-psm11", ocr11
+
+    if len(best_rows) < 2:
+        llm_rows = _toc_rows_from_local_llm(best_text, fallback_page=page_num)
+        if len(llm_rows) > len(best_rows):
+            best_rows, best_method = llm_rows, "toc-text-llm"
+
+    if len(best_rows) < 2 and ENABLE_VISION:
+        img = _load_pdf_page_image(pdf_id, page_num, dpi=300)
+        if img is not None:
+            vision_rows = _toc_rows_from_vision_llm(img, fallback_page=page_num)
+            if len(vision_rows) > len(best_rows):
+                best_rows, best_method = vision_rows, "toc-vision-llm"
+
+    return best_rows, best_method
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TOC ROW PARSING  â€”  two-pass regex, NO LLM
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _ANNEXURE_RE = re.compile(
     r"\b([A-Za-z]-?\d+|Annexure\s*[-\w]*|अनुलग्न\s*[-\d]*)\b", re.IGNORECASE
 )
 
-# Pass-1: strict —  <serial>  <title>  [<annexure>]  <page/range>
+# Pass-1: strict â€”  <serial>  <title>  [<annexure>]  <page/range>
 _ROW_STRICT = re.compile(
     r"^(?P<serial>[०-९\d]+[\.\)\/]?)\s+"
     r"(?P<rest>.{3,}?)\s{1,8}"
-    r"(?P<page>[०-९\d]+(?:\s*[-–to]+\s*[०-९\d]+)?)\s*$",
+    r"(?P<page>[०-९\d]+(?:\s*(?:-|–|to)\s*[०-९\d]+)?)\s*$",
     re.UNICODE,
 )
 
-# Pass-2: loose — any text  <2+ spaces>  <page/range>
+# Pass-2: loose â€” any text  <2+ spaces>  <page/range>
 _ROW_LOOSE = re.compile(
-    r"^(?P<title>.{4,}?)\s{2,}(?P<page>[०-९\d]+(?:\s*[-–]\s*[०-९\d]+)?)\s*$"
+    r"^(?P<title>.{4,}?)\s{2,}(?P<page>[०-९\d]+(?:\s*(?:-|–)\s*[०-९\d]+)?)\s*$"
 )
 
 _SKIP_LINE_RE = re.compile(
@@ -568,8 +919,10 @@ _SKIP_LINE_RE = re.compile(
 
 
 def _parse_page_range(raw: str, fallback: int) -> tuple[int, int]:
-    raw = _to_arabic(raw.strip())
-    m   = re.search(r"(\d+)\s*[-–to]+\s*(\d+)", raw)
+    raw = _to_arabic(raw.strip().rstrip("/"))
+    raw = raw.replace("–", "-").replace("—", "-").replace("−", "-")
+    raw = re.sub(r"\bto\b", "-", raw, flags=re.IGNORECASE)
+    m   = re.search(r"(\d+)\s*-\s*(\d+)", raw)
     if m:
         return int(m.group(1)), int(m.group(2))
     m = re.search(r"(\d+)", raw)
@@ -581,13 +934,13 @@ def _parse_page_range(raw: str, fallback: int) -> tuple[int, int]:
 def parse_toc_rows_from_text(text: str, fallback_page: int = 1) -> list[dict]:
     """
     Extract index rows from OCR text.
-    Pass 1 (strict) → if ≥2 rows found, return immediately.
-    Pass 2 (loose)  → fallback for less-structured layouts.
+    Pass 1 (strict) â†’ if â‰¥2 rows found, return immediately.
+    Pass 2 (loose)  â†’ fallback for less-structured layouts.
     """
     rows:  list[dict] = []
     lines: list[str]  = [l.rstrip() for l in text.splitlines()]
 
-    # ── Pass 1: strict ────────────────────────────────────────────────────────
+    # â”€â”€ Pass 1: strict â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for line in lines:
         m = _ROW_STRICT.match(line.strip())
         if not m:
@@ -614,7 +967,7 @@ def parse_toc_rows_from_text(text: str, fallback_page: int = 1) -> list[dict]:
     if len(rows) >= 2:
         return rows
 
-    # ── Pass 2: loose ─────────────────────────────────────────────────────────
+    # â”€â”€ Pass 2: loose â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     rows = []
     for line in lines:
         line = line.strip()
@@ -635,6 +988,32 @@ def parse_toc_rows_from_text(text: str, fallback_page: int = 1) -> list[dict]:
     return rows
 
 
+def parse_toc_rows_hybrid(text: str, fallback_page: int = 1) -> list[dict]:
+    """
+    Higher-recall TOC parser:
+      1) stitched multiline rows
+      2) existing regex parser
+      3) deduplicate by (title, pageFrom)
+    """
+    stitched = _parse_stitched_toc_rows(text, fallback_page=fallback_page)
+    regex_rows = parse_toc_rows_from_text(text, fallback_page=fallback_page)
+    merged = stitched + regex_rows
+
+    out: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for item in merged:
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        pf = _coerce_int(item.get("pageFrom"), fallback_page)
+        key = (title.lower(), pf)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def _coerce_int(value, fallback: int) -> int:
     if isinstance(value, int):   return value
     if isinstance(value, float): return int(value)
@@ -648,8 +1027,8 @@ def build_toc_ranges_from_items(
     items: list[dict], indexed_start: int, range_end: int, default_source: str
 ) -> list[dict]:
     """
-    Normalize → sort → deduplicate → forward-fill page ranges.
-    Each item's pageTo = next item's pageFrom − 1  (when unambiguous).
+    Normalize â†’ sort â†’ deduplicate â†’ forward-fill page ranges.
+    Each item's pageTo = next item's pageFrom âˆ’ 1  (when unambiguous).
     """
     out:  list[dict]  = []
     seen: set[tuple]  = set()
@@ -691,9 +1070,9 @@ def build_toc_ranges_from_items(
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# VECTOR VERIFICATION  —  local embeddings, NO LLM
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# VECTOR VERIFICATION  â€”  local embeddings, NO LLM
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def tokenize(text: str) -> list[str]:
     return [t for t in re.findall(r"\w+", (text or "").lower(), flags=re.UNICODE) if len(t) > 1]
@@ -725,7 +1104,7 @@ def verify_index_items_with_vectors(
     try:
         col = chroma_client.get_collection(f"pdf_{pdf_id}")
     except Exception:
-        log.warning("Collection not found for %s — skipping verification", pdf_id)
+        log.warning("Collection not found for %s â€” skipping verification", pdf_id)
         return index_items
 
     all_res = col.get(include=["documents", "metadatas", "embeddings"])
@@ -809,9 +1188,9 @@ def verify_index_items_with_vectors(
     return verified
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PARENT-DOCUMENT CLASSIFICATION  —  alias map + local embeddings, NO LLM
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# PARENT-DOCUMENT CLASSIFICATION  â€”  alias map + local embeddings, NO LLM
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _ALIAS_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(table\s+of\s+contents|index)\b|सूची|विषय.?सूची|अनुक्रमणिका", re.I), "Index"),
@@ -980,9 +1359,9 @@ def _merge_adjacent(items: list[dict]) -> list[dict]:
     return merged
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # JSON EXPORT  (index_exports/)
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def export_index_json(pdf_id: str, filename: str, index: list[dict]) -> str:
     safe = re.sub(r"[^\w\-.]", "_", Path(filename).stem)[:60]
@@ -994,13 +1373,13 @@ def export_index_json(pdf_id: str, filename: str, index: list[dict]) -> str:
         ),
         encoding="utf-8",
     )
-    log.info("Index JSON exported → %s", out)
+    log.info("Index JSON exported â†’ %s", out)
     return str(out)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # REQUEST / RESPONSE MODELS
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class QueryRequest(BaseModel):
     pdf_id:       str
@@ -1013,9 +1392,9 @@ class IndexRequest(BaseModel):
     pdf_id: str
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/health")
 def health():
@@ -1034,7 +1413,7 @@ def health():
     }
 
 
-# ── /api/ingest ────────────────────────────────────────────────────────────────
+# â”€â”€ /api/ingest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.post("/api/ingest")
 async def ingest_pdf(
     file:       UploadFile    = File(...),
@@ -1044,8 +1423,8 @@ async def ingest_pdf(
     """
     Full ingest:
       1. OCR / extract all pages
-      2. Vectorize → ChromaDB
-      3. Persist text → PostgreSQL
+      2. Vectorize â†’ ChromaDB
+      3. Persist text â†’ PostgreSQL
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted")
@@ -1053,7 +1432,7 @@ async def ingest_pdf(
     pdf_bytes = await file.read()
     pdf_id    = pdf_id_from_bytes(pdf_bytes)
     stored_pdf_path(pdf_id).write_bytes(pdf_bytes)
-    log.info("Ingest — file=%s  id=%s", file.filename, pdf_id)
+    log.info("Ingest â€” file=%s  id=%s", file.filename, pdf_id)
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = doc.page_count
@@ -1101,13 +1480,13 @@ async def ingest_pdf(
     }
 
 
-# ── /api/generate-index ────────────────────────────────────────────────────────
+# â”€â”€ /api/generate-index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.post("/api/generate-index")
 async def generate_index(req: IndexRequest):
     """
-    Pure-local index generation (no LLM, no cloud):
-      1. Detect TOC pages in 1-10   (regex)
-      2. Parse TOC rows              (regex, two-pass)
+    Pure-local index generation (no cloud):
+      1. Detect TOC pages in 1-25   (hybrid ranking)
+      2. Parse TOC rows              (stitching + OCR/LLM fallback)
       3. Build / forward-fill ranges
       4. Verify via local vectors
       5. Classify document types     (alias map + local embeddings)
@@ -1123,19 +1502,23 @@ async def generate_index(req: IndexRequest):
 
     all_pages.sort(key=lambda x: x["page_num"])
     total_pages = record["total_pages"]
-    toc_window  = [p for p in all_pages if 1 <= p["page_num"] <= min(10, total_pages)]
+    toc_window_end = min(25, total_pages)
+    toc_window = [p for p in all_pages if 1 <= p["page_num"] <= toc_window_end]
 
-    # Step 1 — detect TOC candidate pages
-    candidates     = detect_toc_candidate_pages(toc_window, max_candidates=5)
-    candidate_nums = [p["page_num"] for p in candidates]
-    log.info("TOC candidates: %s", candidate_nums)
+    # Step 1 - hybrid TOC ranking in pages 1..25
+    top_candidates = detect_toc_candidate_pages(toc_window, max_candidates=6)
+    candidate_nums = [int(p["page_num"]) for p in top_candidates]
+    expanded_candidates = expand_toc_candidate_pages(top_candidates, all_pages)
+    expanded_candidate_nums = [int(p["page_num"]) for p in expanded_candidates]
+    log.info("TOC top candidates: %s", candidate_nums)
+    log.info("TOC expanded candidates: %s", expanded_candidate_nums)
 
-    # Step 2 — parse rows
+    # Step 2 - parse TOC rows with stitching + TOC-only OCR/LLM fallback
     raw_items: list[dict] = []
-    for page in candidates:
-        parsed = parse_toc_rows_from_text(page["text"], fallback_page=page["page_num"])
+    for page in expanded_candidates:
+        parsed, method = extract_toc_rows_with_fallback(req.pdf_id, page)
         if parsed:
-            log.info("Page %s → %s rows", page["page_num"], len(parsed))
+            log.info("TOC rows p=%s -> %s via %s", page["page_num"], len(parsed), method)
             raw_items.extend(parsed)
 
     # Deduplicate across overlapping candidates
@@ -1148,32 +1531,32 @@ async def generate_index(req: IndexRequest):
             deduped.append(item)
     raw_items = deduped
 
-    # Step 3 — build page ranges
+    # Step 3 â€” build page ranges
     index_items: list[dict] = []
     if len(raw_items) >= 2:
         index_items = build_toc_ranges_from_items(
-            raw_items, indexed_start=1, range_end=total_pages, default_source="toc-regex"
+            raw_items, indexed_start=1, range_end=total_pages, default_source="toc-hybrid"
         )
 
     if not index_items:
         raise HTTPException(
             422,
             detail=(
-                "No usable table of contents / index found in pages 1–10. "
+                "No usable table of contents / index found in pages 1-25. "
                 "Confirm the PDF has an index page, or add entries manually."
             ),
         )
 
-    # Step 4 — vector verification
+    # Step 4 â€” vector verification
     verified = verify_index_items_with_vectors(req.pdf_id, index_items, all_pages)
 
-    # Step 5 — classify document types
+    # Step 5 â€” classify document types
     classified = classify_index_items(verified, all_pages)
 
-    # Step 6 — persist
+    # Step 6 â€” persist
     save_index(req.pdf_id, classified)
     update_pdf_record(
-        req.pdf_id, status="index_ready", index_ready=True, index_source="toc-regex"
+        req.pdf_id, status="index_ready", index_ready=True, index_source="toc-hybrid"
     )
 
     try:
@@ -1191,10 +1574,11 @@ async def generate_index(req: IndexRequest):
         "indexed_page_start":  1,
         "indexed_page_end":    total_pages,
         "indexed_pages":       len(all_pages),
-        "toc_search_window":   [1, min(10, total_pages)],
+        "toc_search_window":   [1, toc_window_end],
         "toc_candidate_pages": candidate_nums,
+        "toc_expanded_pages":  expanded_candidate_nums,
         "toc_items_parsed":    len(raw_items),
-        "index_source":        "toc-regex",
+        "index_source":        "toc-hybrid",
         "export_path":         export_path,
         "status":              record["status"],
         "retrieval_status":    record["retrieval_status"],
@@ -1203,7 +1587,7 @@ async def generate_index(req: IndexRequest):
     }
 
 
-# ── /api/query ─────────────────────────────────────────────────────────────────
+# â”€â”€ /api/query â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.post("/api/query")
 async def query_pdf(req: QueryRequest):
     """Hybrid retrieval + qwen2.5:14b answer generation."""
@@ -1275,7 +1659,7 @@ async def query_pdf(req: QueryRequest):
     return {"answer": answer, "page_refs": page_refs, "chunks_used": len(top)}
 
 
-# ── Standard CRUD / status ─────────────────────────────────────────────────────
+# â”€â”€ Standard CRUD / status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/api/index/{pdf_id}")
 async def get_saved_index_route(pdf_id: str):
@@ -1408,11 +1792,11 @@ async def get_batch_reports(limit: int = 8):
     return {"reports": [], "limit": max(1, min(limit, 100))}
 
 
-# ── Startup ────────────────────────────────────────────────────────────────────
+# â”€â”€ Startup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
-    log.info("═══ Court File Indexer v5.0  (Local-Only Pipeline) ═══")
+    log.info("â•â•â• Court File Indexer v5.0  (Local-Only Pipeline) â•â•â•")
     log.info("Text model     : %s", LOCAL_TEXT_MODEL)
     log.info("Vision model   : %s  (assist=%s)", LOCAL_VISION_MODEL, ENABLE_VISION)
     log.info("LLM endpoint   : %s  (timeout=%ss)", LOCAL_LLM_BASE_URL, LOCAL_LLM_TIMEOUT)
@@ -1421,4 +1805,4 @@ async def startup():
     log.info("Parent types   : %s loaded", len(PARENT_DOCUMENT_NAMES))
     log.info("Index exports  : %s", INDEX_EXPORT_PATH)
     log.info("Workflow store : %s (%s)", STORAGE_BACKEND, STORAGE_TARGET)
-    log.info("Server ready ✓")
+    log.info("Server ready âœ“")
