@@ -1,4 +1,4 @@
-﻿import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import "./App.css";
 import { documentCatalog } from "./documentCatalog";
 
@@ -19,11 +19,18 @@ const EMPTY_QUEUE_SNAPSHOT = {
   reindex_runner: { running: false, processed: 0, total: 0, fixed: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
 };
 
-const getFetchErrorMessage = (err) => {
+const getFetchErrorMessage = (err, path = "") => {
   if (err instanceof TypeError && /fetch/i.test(err.message)) {
-    return `Cannot reach the backend. Check the server, proxy, and backend logs${API ? ` at ${API}` : ""}.`;
+    return `Cannot reach the backend${path ? ` for ${path}` : ""}. Check the server, proxy, and backend logs${API ? ` at ${API}` : ""}.`;
   }
-  return err.message || "Request failed";
+  const rawMessage = err?.message || "Request failed";
+  if (/^500:/i.test(rawMessage)) {
+    return `Backend returned 500${path ? ` for ${path}` : ""}. ${rawMessage.replace(/^500:\s*/i, "")}`.trim();
+  }
+  if (/^404:/i.test(rawMessage)) {
+    return `Requested data was not found${path ? ` for ${path}` : ""}. ${rawMessage.replace(/^404:\s*/i, "")}`.trim();
+  }
+  return rawMessage;
 };
 
 const loadPdfJs = () =>
@@ -55,7 +62,7 @@ const apiFetch = async (path, opts = {}) => {
     }
     return resp.json();
   } catch (err) {
-    throw new Error(getFetchErrorMessage(err));
+    throw new Error(getFetchErrorMessage(err, path));
   }
 };
 
@@ -68,7 +75,7 @@ const apiUpload = async (path, formData) => {
     }
     return resp.json();
   } catch (err) {
-    throw new Error(getFetchErrorMessage(err));
+    throw new Error(getFetchErrorMessage(err, path));
   }
 };
 
@@ -81,25 +88,25 @@ const describeSavedPdfStatus = (item = {}, flags = {}) => {
     return "Full ingestion and vectorization are running for this PDF.";
   }
   if (flags.isIndexBusy || flags.isStage1BatchBusy || status === "indexing_running") {
-    return "Stage 1 indexing is running in the background for this PDF.";
+    return "Full-document indexing is running in the background for this PDF.";
   }
   if (item.review_reason) {
     return `Flagged for review: ${item.review_reason}`;
   }
   if (status === "queued_for_stage1" || item.queue_bucket === "stage1_batch") {
-    return "Uploaded and queued for Stage 1 indexing. The backend will continue even if you close the browser.";
+    return "Uploaded and queued for full-document indexing. The backend will continue even if you close the browser.";
   }
   if ((retrieval === "full_ingestion_running" || status === "full_ingestion_running") && pending > 0) {
-    return "Stage 1 index is ready. Full ingestion and vectorization are now running.";
+    return "Full-document extraction and vectorization are running before final indexing.";
   }
   if (status === "index_ready" && pending > 0 && retrieval === "queued_for_full_ingestion") {
-    return "Stage 1 index is ready. Remaining pages are queued for full ingestion.";
+    return "Legacy partial record detected. Remaining pages are queued for full ingestion.";
   }
   if (status === "index_ready" && pending > 0) {
-    return "Stage 1 index is ready. Remaining pages can now be vectorized from the deferred queue.";
+    return "Legacy partial record detected. Remaining pages can be vectorized from the deferred queue.";
   }
   if (pending > 0) {
-    return "Stage 1 index is ready. Remaining pages are still pending vectorization.";
+    return "Legacy partial record detected. Remaining pages are still pending vectorization.";
   }
   return "This PDF is fully ready in the backend library.";
 };
@@ -108,13 +115,52 @@ const formatSavedPdfStatus = (item = {}) => {
   const status = (item.status || "").toLowerCase();
   const retrieval = (item.retrieval_status || "").toLowerCase();
 
-  if (status === "queued_for_stage1") return "Queued for Stage 1";
-  if (status === "indexing_running") return "Stage 1 Running";
-  if (status === "index_ready") return retrieval === "queued_for_full_ingestion" ? "Index Ready, Deferred Queued" : "Index Ready";
+  if (status === "queued_for_stage1") return "Queued for Indexing";
+  if (status === "indexing_running") return "Indexing Running";
+  if (status === "extracting_text") return "Extracting Text";
+  if (status === "vectorizing") return "Vectorizing";
+  if (status === "building_index") return "Building Index";
+  if (status === "index_ready") return retrieval === "queued_for_full_ingestion" ? "Index Ready, Review Pending" : "Index Ready";
   if (status === "full_ingestion_running" || retrieval === "full_ingestion_running") return "Full Ingestion Running";
   if (status === "vectorized" || retrieval === "vectorized") return "Vectorized";
   if (status === "failed" || retrieval === "failed") return "Failed";
   return item.status || "Unknown";
+};
+
+const getCurrentStepLabel = (item = {}) => {
+  const status = String(item.status || "").toLowerCase();
+  const retrieval = String(item.retrieval_status || "").toLowerCase();
+  if (item.review_reason || status === "needs_review" || item.queue_bucket === "reindex_review") return "Sent to review";
+  if (status === "building_index") return "Building index";
+  if (status === "vectorizing") return "Vectorizing";
+  if (status === "extracting_text" || retrieval === "full_ingestion_running") return "Extracting text";
+  if (status === "vectorized" || item.index_ready || item.chat_ready) return "Finalized";
+  if (status === "queued_for_stage1") return "Queued";
+  return "Ready";
+};
+
+const TIMING_STAGE_LABELS = {
+  file_open: "File open",
+  first_10_page_extraction: "Initial extraction",
+  ocr_time: "OCR",
+  toc_detection: "TOC detection",
+  llm_indexing_time: "Index generation",
+  json_generation_time: "JSON export",
+  full_text_extraction_time: "Full text extraction",
+  chunking_time: "Chunking",
+  embedding_time: "Embeddings",
+  vector_db_insert_time: "Vector DB insert",
+  total_vectorization_time: "Total vectorization",
+  saved_pdf_load_time: "PDF load in viewer",
+};
+
+const formatTimingLabel = (key = "") => TIMING_STAGE_LABELS[key] || key.replace(/_/g, " ").trim();
+
+const formatEventTimestamp = (value = "") => {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString();
 };
 
 const apiFetchBlob = async (path, opts = {}) => {
@@ -126,7 +172,7 @@ const apiFetchBlob = async (path, opts = {}) => {
     }
     return resp.blob();
   } catch (err) {
-    throw new Error(getFetchErrorMessage(err));
+    throw new Error(getFetchErrorMessage(err, path));
   }
 };
 
@@ -243,10 +289,10 @@ const normalizeSections = (items = [], batchNo = "") =>
     displayTitle: (item.displayTitle || item.originalTitle || "").trim(),
     originalTitle: (item.originalTitle || item.displayTitle || item.title || "").trim(),
     batchNo: (item.batchNo || batchNo || "").trim(),
+    pageFrom: item.pageFrom || item.pdfPageFrom || 1,
+    pageTo: item.pageTo || item.pdfPageTo || item.pageFrom || item.pdfPageFrom || 1,
     pdfPageFrom: item.pdfPageFrom || item.pageFrom || 1,
     pdfPageTo: item.pdfPageTo || item.pageTo || item.pageFrom || 1,
-    tocPageFrom: item.tocPageFrom || "",
-    tocPageTo: item.tocPageTo || "",
   }));
 
 const formatPageValue = (primaryFrom, primaryTo, fallbackFrom, fallbackTo, primaryLabel, fallbackLabel) => {
@@ -396,43 +442,55 @@ function QueueStatusModal({
   forceResetQueue,
   startIndexAudit,
   runReviewReindexQueue,
+  stopAllProcessing,
+  timingEvents,
+  viewerTimingEvent,
+  showTimingPanel,
+  setShowTimingPanel,
+  selectedPdfLabel,
   auditRowStart,
   auditRowEnd,
   setAuditRowStart,
   setAuditRowEnd,
   pdfSearch,
   batchFilter,
+  batchReports = [],
 }) {
   if (!open) return null;
 
-  const reviewQueueCount = (queueSnapshot.reindex_review || []).length;
-  const stage1QueueCount = (queueSnapshot.stage1_batch || []).length;
+  const reviewQueue = queueSnapshot.reindex_review || [];
+  const batchQueue = queueSnapshot.stage1_batch || [];
+  const pendingQueue = queueSnapshot.pending_vectorization || [];
+  const reviewQueueCount = reviewQueue.length;
+  const stage1QueueCount = batchQueue.length;
   const auditHeartbeatAgeSeconds = auditRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - auditRunner.heartbeat_ts)) : 0;
   const reindexHeartbeatAgeSeconds = reindexRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - reindexRunner.heartbeat_ts)) : 0;
+  const currentReviewPosition = reindexRunner.running ? Math.min((reindexRunner.processed || 0) + 1, reindexRunner.total || 0) : 0;
+  const currentBatchPosition = stage1BatchRunner.running ? Math.min((stage1BatchRunner.processed || 0) + 1, stage1BatchRunner.total || 0) : 0;
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal-box queue-modal-box">
         <div className="queue-modal-header">
           <div>
-            <div className="section-title">Queue And Live Status</div>
-            <div className="section-subtitle">Keep deferred processing, index audit, and review reindexing in one clean operations panel.</div>
+            <div className="section-title">Operations Panel</div>
+            <div className="section-subtitle">Keep batch indexing, audit, and review reindexing in one clean operations panel.</div>
           </div>
           <button className="modal-close" onClick={onClose}>x</button>
         </div>
         <div className="queue-toolbar">
           <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
-          <span className="queue-pill">Stage 1 batch queue: {stage1QueueCount}</span>
+          <span className="queue-pill">Batch indexing queue: {stage1QueueCount}</span>
           <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
           <span className="queue-pill warning">Review queue: {reviewQueueCount}</span>
           {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
             <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
           )}
           {indexRunner.running && (
-            <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
+            <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Indexing running"}</span>
           )}
           {stage1BatchRunner.running && (
-            <span className="queue-pill success">Overnight Stage 1: {stage1BatchRunner.processed || 0}/{stage1BatchRunner.total || 0}</span>
+            <span className="queue-pill success">Batch indexing: {stage1BatchRunner.processed || 0}/{stage1BatchRunner.total || 0}</span>
           )}
           {auditRunner.running && (
             <span className="queue-pill warning">Audit: {auditRunner.processed || 0}/{auditRunner.total || 0} - flagged {auditRunner.flagged || 0}</span>
@@ -473,13 +531,116 @@ function QueueStatusModal({
           <button className="queue-run-btn" onClick={runAllDeferredQueue} disabled={loading || queueSnapshot.runner?.running || queueSnapshot.runner?.paused}>Run All Deferred Queue</button>
           <button className="queue-pause-btn" onClick={() => controlDeferredQueue("stop")} disabled={loading || !queueSnapshot.runner?.running}>Stop Queue</button>
           <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
+          <button className="queue-stop-all-btn" onClick={stopAllProcessing} disabled={loading}>Stop All Processing</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
-          <button className="queue-reset-btn" onClick={() => forceResetQueue("stage1_batch")} disabled={loading || stage1BatchRunner.running}>Force Reset Stage 1 Batch Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("stage1_batch")} disabled={loading || stage1BatchRunner.running}>Force Reset Batch Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("reindex")} disabled={loading || reindexRunner.running}>Clear Review Queue</button>
         </div>
         <div className="library-help">
-          Chunked batch upload feeds the overnight Stage 1 queue, which then auto-chains into full ingestion. The review queue is separate and only repairs bad saved indexes from already vectorized PDFs.
+          Chunked batch upload feeds the backend indexing queue, which processes whole PDFs before generating final indexes. The review queue is separate and only repairs suspicious saved indexes from already vectorized PDFs.
+        </div>
+        <div className="queue-list-grid">
+          <div className="queue-list-card">
+            <div className="queue-list-title">Review Queue</div>
+            <div className="queue-list-subtitle">Top of queue is shown first, so operators always know the exact PDF order.</div>
+            {reviewQueue.length ? reviewQueue.slice(0, 8).map((item, idx) => (
+              <div key={`review-${item.pdf_id}`} className="queue-list-row">
+                <div className="queue-list-number">#{idx + 1}</div>
+                <div className="queue-list-content">
+                  <div className="queue-list-name">{item.cnr_number || item.filename || item.pdf_id}</div>
+                  <div className="queue-list-meta">{item.filename || item.pdf_id}{item.review_reason ? ` - ${item.review_reason}` : ""}</div>
+                </div>
+              </div>
+            )) : <div className="queue-list-empty">No PDFs are waiting in the review queue.</div>}
+          </div>
+          <div className="queue-list-card">
+            <div className="queue-list-title">Batch Queue</div>
+            <div className="queue-list-subtitle">Current position: {stage1BatchRunner.running ? `${currentBatchPosition} of ${stage1BatchRunner.total || 0}` : 'Idle'}</div>
+            {batchQueue.length ? batchQueue.slice(0, 8).map((item, idx) => (
+              <div key={`batch-${item.pdf_id}`} className="queue-list-row">
+                <div className="queue-list-number">#{idx + 1}</div>
+                <div className="queue-list-content">
+                  <div className="queue-list-name">{item.cnr_number || item.filename || item.pdf_id}</div>
+                  <div className="queue-list-meta">{item.filename || item.pdf_id}</div>
+                </div>
+              </div>
+            )) : <div className="queue-list-empty">No PDFs are waiting in the batch queue.</div>}
+          </div>
+        </div>
+        <div className="runner-panel compact batch-report-panel">
+          <div className="runner-panel-header">
+            <span className="runner-state idle">Recent Batch Reports</span>
+            <span className="runner-meta">Saved in backend for overnight comparison</span>
+          </div>
+          {(Array.isArray(batchReports) && batchReports.length) ? (
+            <div className="batch-report-list">
+              {batchReports.map((report) => {
+                const summary = report.summary || {};
+                return (
+                  <div key={report.batch_run_id} className="batch-report-card">
+                    <div className="batch-report-head">
+                      <strong>{report.batch_run_id}</strong>
+                      <span className={`runner-state ${report.status === 'completed' ? 'idle' : 'running'}`}>{report.status || 'unknown'}</span>
+                    </div>
+                    <div className="batch-report-meta">Started {formatEventTimestamp(report.started_at)} | Last update {formatEventTimestamp(report.generated_at)}</div>
+                    <div className="batch-report-grid">
+                      <div><span>Total PDFs</span><strong>{summary.total_pdfs || 0}</strong></div>
+                      <div><span>Completed</span><strong>{summary.completed_pdfs || 0}</strong></div>
+                      <div><span>Review</span><strong>{summary.review_pdfs || 0}</strong></div>
+                      <div><span>Vectorized</span><strong>{summary.vectorized_pdfs || 0}</strong></div>
+                      <div><span>Logged time</span><strong>{summary.total_logged_seconds || 0}s</strong></div>
+                    </div>
+                    <div className="batch-report-meta">{report.path}</div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : <div className="queue-list-empty">No batch reports have been saved yet.</div>}
+        </div>
+
+        <div className="runner-panel compact timing-panel">
+          <div className="runner-panel-header">
+            <span className="runner-state idle">Timing History</span>
+            <span className="runner-meta">{selectedPdfLabel || "No PDF selected"}</span>
+            <button className="add-toggle-btn" onClick={() => setShowTimingPanel((value) => !value)}>{showTimingPanel ? "Hide Logs" : "Show Logs"}</button>
+          </div>
+          {showTimingPanel && (
+            <div className="timing-history-list">
+              {viewerTimingEvent ? (
+                <div className="timing-history-card timing-history-card-local">
+                  <div className="timing-history-head">
+                    <span className="timing-run-label">{viewerTimingEvent.run_label}</span>
+                    <span className="timing-run-meta">{formatEventTimestamp(viewerTimingEvent.recorded_at)} - total {viewerTimingEvent.total_seconds}s</span>
+                  </div>
+                  <div className="timing-history-grid">
+                    {Object.entries(viewerTimingEvent.timings || {}).map(([key, value]) => (
+                      <div key={`${viewerTimingEvent.recorded_at}-${key}`} className="timing-history-row">
+                        <span>{formatTimingLabel(key)}</span>
+                        <strong>{value}s</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {timingEvents.length ? timingEvents.map((event, idx) => (
+                <div key={`timing-${idx}-${event.recorded_at}`} className="timing-history-card">
+                  <div className="timing-history-head">
+                    <span className="timing-run-label">{event.run_label}</span>
+                    <span className="timing-run-meta">{formatEventTimestamp(event.recorded_at)} - total {event.total_seconds}s</span>
+                  </div>
+                  <div className="timing-history-grid">
+                    {Object.entries(event.timings || {}).map(([key, value]) => (
+                      <div key={`${event.recorded_at}-${key}`} className="timing-history-row">
+                        <span>{formatTimingLabel(key)}</span>
+                        <strong>{value}s</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )) : (!viewerTimingEvent ? <div className="queue-list-empty">No timing history recorded yet for this PDF.</div> : null)}
+            </div>
+          )}
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
@@ -518,7 +679,7 @@ function QueueStatusModal({
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
-            <span className={`runner-state ${stage1BatchRunner.running ? "running" : "idle"}`}>{stage1BatchRunner.running ? "Stage 1 Batch Running" : "Stage 1 Batch Idle"}</span>
+            <span className={`runner-state ${stage1BatchRunner.running ? "running" : "idle"}`}>{stage1BatchRunner.running ? "Batch Indexing Running" : "Batch Indexing Idle"}</span>
             <span className="runner-meta">Processed {stage1BatchRunner.processed || 0} of {stage1BatchRunner.total || 0}</span>
             {stage1BatchRunner.heartbeat_ts ? <span className="runner-meta">Last update {Math.max(0, Math.round(Date.now() / 1000 - stage1BatchRunner.heartbeat_ts))}s ago</span> : null}
           </div>
@@ -526,10 +687,11 @@ function QueueStatusModal({
             <div>
               <div className="runner-label">Current PDF</div>
               <div className="runner-value">{stage1BatchRunner.current_filename || stage1BatchRunner.current_pdf_id || "None"}</div>
+              {stage1BatchRunner.running ? <div className="runner-value muted">Position {currentBatchPosition} of {stage1BatchRunner.total || 0} from top of queue</div> : null}
             </div>
             <div>
               <div className="runner-label">Queue State</div>
-              <div className="runner-value">{stage1BatchRunner.running ? "Chunked batch queue is processing in backend and auto-chaining into full ingestion." : "No overnight Stage 1 batch queue is running."}</div>
+              <div className="runner-value">{stage1BatchRunner.running ? "Chunked batch queue is processing full-document indexing in the backend." : "No batch indexing queue is running."}</div>
             </div>
             <div>
               <div className="runner-label">Last Error</div>
@@ -537,7 +699,7 @@ function QueueStatusModal({
             </div>
             <div>
               <div className="runner-label">Operator Hint</div>
-              <div className="runner-value muted">Upload large batches in chunks and let the backend continue even after the browser tab is closed.</div>
+              <div className="runner-value muted">Upload large batches in chunks and let the backend finish full-document indexing even after the browser tab is closed.</div>
             </div>
           </div>
         </div>
@@ -578,6 +740,7 @@ function QueueStatusModal({
             <div>
               <div className="runner-label">Current PDF</div>
               <div className="runner-value">{reindexRunner.current_filename || reindexRunner.current_pdf_id || "None"}</div>
+              {reindexRunner.running ? <div className="runner-value muted">Position {currentReviewPosition} of {reindexRunner.total || 0} from top of review queue</div> : null}
             </div>
             <div>
               <div className="runner-label">Review Queue</div>
@@ -603,14 +766,16 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
   const [subDoc, setSubDoc] = useState(section.subDocument || "");
   const [note, setNote] = useState(section.note || "");
   const [batchNo, setBatchNo] = useState(section.batchNo || "");
-  const [pageFrom, setPageFrom] = useState(section.pageFrom || 1);
-  const [pageTo, setPageTo] = useState(section.pageTo || 1);
+  const [pageFrom, setPageFrom] = useState(section.pageFrom || section.pdfPageFrom || 1);
+  const [pageTo, setPageTo] = useState(section.pageTo || section.pdfPageTo || section.pageFrom || 1);
   const [recDate, setRecDate] = useState(section.receivingDate || "");
 
   const save = () => {
     if (!title.trim()) return;
-    const pf = Math.max(1, Math.min(parseInt(pageFrom, 10) || 1, totalPages));
-    const pt = Math.max(pf, Math.min(parseInt(pageTo, 10) || pf, totalPages));
+    const rawFrom = parseInt(pageFrom, 10);
+    const rawTo = parseInt(pageTo, 10);
+    const resolvedFrom = Math.max(1, Math.min(rawFrom || section.pageFrom || 1, totalPages));
+    const resolvedTo = Math.max(resolvedFrom, Math.min(rawTo || resolvedFrom, totalPages));
     const normalizedSubDoc = subDoc.trim() || "null";
     onSave({
       ...section,
@@ -618,8 +783,10 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
       subDocument: normalizedSubDoc,
       note: note.trim(),
       batchNo: batchNo.trim(),
-      pageFrom: pf,
-      pageTo: pt,
+      pageFrom: resolvedFrom,
+      pageTo: resolvedTo,
+      pdfPageFrom: resolvedFrom,
+      pdfPageTo: resolvedTo,
       receivingDate: recDate,
       source: section.source === "gap" ? "manual" : section.source,
     });
@@ -627,7 +794,7 @@ function InlineEditRow({ section, totalPages, onSave, onCancel }) {
 
   return (
     <tr className="inline-edit-row">
-      <td colSpan={7} style={{ padding: 0 }}>
+      <td colSpan={8} style={{ padding: 0 }}>
         <div className="inline-edit-panel">
           <div className="inline-edit-header">
             <span>Edit Entry</span>
@@ -693,9 +860,9 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
   const [total, setTotal] = useState("");
 
   useEffect(() => {
-    const pf = parseInt(pageFrom, 10);
-    const pt = parseInt(pageTo, 10);
-    if (pf && pt && pt >= pf) setTotal(String(pt - pf + 1));
+    const preferredFrom = parseInt(pageFrom, 10);
+    const preferredTo = parseInt(pageTo, 10);
+    if (preferredFrom && preferredTo && preferredTo >= preferredFrom) setTotal(String(preferredTo - preferredFrom + 1));
   }, [pageFrom, pageTo]);
 
   useEffect(() => {
@@ -711,16 +878,21 @@ function AddEntryPanel({ totalPages, caseApplicant, defaultBatchNo, onAdd, docum
   const save = () => {
     const title = doc === "Other" ? customDocName.trim() : doc.trim();
     if (!title) return;
-    const pf = Math.max(1, Math.min(parseInt(pageFrom, 10) || 1, totalPages));
-    const pt = Math.max(pf, Math.min(parseInt(pageTo, 10) || pf, totalPages));
+    const rawFrom = parseInt(pageFrom, 10);
+    const rawTo = parseInt(pageTo, 10);
+    const resolvedFrom = Math.max(1, Math.min(rawFrom || 1, totalPages));
+    const resolvedTo = Math.max(resolvedFrom, Math.min(rawTo || resolvedFrom, totalPages));
+
     onAdd({
       title,
       subDocument: subDoc.trim() || "null",
       note: note.trim(),
       batchNo: batchNo.trim(),
-      pageFrom: pf,
-      pageTo: pt,
-      totalPage: parseInt(total, 10) || (pt - pf + 1),
+      pageFrom: resolvedFrom,
+      pageTo: resolvedTo,
+      pdfPageFrom: resolvedFrom,
+      pdfPageTo: resolvedTo,
+      totalPage: parseInt(total, 10) || (resolvedTo - resolvedFrom + 1),
       receivingDate: recDate,
       source: "manual",
     });
@@ -956,6 +1128,10 @@ export default function App() {
   const [savedPdfs, setSavedPdfs] = useState([]);
   const [queueSnapshot, setQueueSnapshot] = useState(EMPTY_QUEUE_SNAPSHOT);
   const [selectedSavedPdfId, setSelectedSavedPdfId] = useState("");
+  const [timingEvents, setTimingEvents] = useState([]);
+  const [batchReports, setBatchReports] = useState([]);
+  const [showTimingPanel, setShowTimingPanel] = useState(false);
+  const [viewerTimingEvent, setViewerTimingEvent] = useState(null);
 
   const [tab, setTab] = useState("index");
   const [loading, setLoading] = useState(false);
@@ -977,9 +1153,14 @@ export default function App() {
   const [indexSpotlight, setIndexSpotlight] = useState(false);
   const handledIndexRunnerRef = useRef("");
   const handledReviewRunnerRef = useRef("");
+  const activeLoadRequestRef = useRef(0);
   const indexSectionRef = useRef(null);
   const indexSpotlightTimeoutRef = useRef(null);
   const pdfCacheRef = useRef(new Map());
+  const apiSupportRef = useRef({
+    queues: true,
+    batchReports: true,
+  });
 
   const rebuildCoverage = useCallback((items, total) => {
     const cmap = {};
@@ -1132,20 +1313,70 @@ export default function App() {
   }, []);
 
   const fetchQueues = useCallback(async () => {
+    if (!apiSupportRef.current.queues) {
+      setQueueSnapshot(EMPTY_QUEUE_SNAPSHOT);
+      return;
+    }
     try {
       const resp = await apiFetch("/api/queues");
       setQueueSnapshot(resp || EMPTY_QUEUE_SNAPSHOT);
     } catch (err) {
+      const msg = String(err?.message || "");
+      if (msg.includes("/api/queues") && msg.toLowerCase().includes("not found")) {
+        apiSupportRef.current.queues = false;
+        setQueueSnapshot(EMPTY_QUEUE_SNAPSHOT);
+        return;
+      }
       console.error(err);
+    }
+  }, []);
+
+  const fetchPdfTimings = useCallback(async (targetPdfId = "") => {
+    if (!targetPdfId) {
+      setTimingEvents([]);
+      setViewerTimingEvent(null);
+      return;
+    }
+    try {
+      const resp = await apiFetch(`/api/pdfs/${targetPdfId}/timings`);
+      setTimingEvents(resp.events || []);
+    } catch (err) {
+      console.error(err);
+      setTimingEvents([]);
+    }
+  }, []);
+
+  const fetchBatchReports = useCallback(async () => {
+    if (!apiSupportRef.current.batchReports) {
+      setBatchReports([]);
+      return;
+    }
+    try {
+      const resp = await apiFetch('/api/batch-reports?limit=8');
+      setBatchReports(resp.reports || []);
+    } catch (err) {
+      const msg = String(err?.message || "");
+      if (msg.includes("/api/batch-reports") && msg.toLowerCase().includes("not found")) {
+        apiSupportRef.current.batchReports = false;
+        setBatchReports([]);
+        return;
+      }
+      console.error(err);
+      setBatchReports([]);
     }
   }, []);
 
   const loadSavedPdf = useCallback(async (targetPdfId) => {
     if (!targetPdfId) return;
+    const requestId = activeLoadRequestRef.current + 1;
+    activeLoadRequestRef.current = requestId;
+    const loadStartedAt = performance.now();
     setError("");
-    setLoading(true);
     const cached = touchCachedPdf(targetPdfId);
-    setLoadingStep(cached ? "Opening saved PDF from memory cache..." : "Loading saved PDF from backend...");
+    if (!cached) {
+      setLoading(true);
+      setLoadingStep("Loading saved PDF from backend...");
+    }
     try {
       let details = cached?.details;
       let objectUrl = cached?.objectUrl;
@@ -1157,15 +1388,28 @@ export default function App() {
           apiFetchBlob(`/api/pdfs/${targetPdfId}/file`),
           loadPdfJs(),
         ]);
+        if (activeLoadRequestRef.current !== requestId) {
+          return;
+        }
         details = fetchedDetails;
         objectUrl = URL.createObjectURL(blob);
         const arrayBuf = await blob.arrayBuffer();
         doc = await pdfjsLib.getDocument({ data: arrayBuf.slice(0) }).promise;
+        if (activeLoadRequestRef.current !== requestId) {
+          try {
+            URL.revokeObjectURL(objectUrl);
+          } catch (_) {}
+          return;
+        }
         storeCachedPdf(targetPdfId, {
           details,
           objectUrl,
           pdfDoc: doc,
         });
+      }
+
+      if (activeLoadRequestRef.current !== requestId) {
+        return;
       }
 
       const pdf = details?.pdf || {};
@@ -1178,27 +1422,40 @@ export default function App() {
       setTotalPages(pdf.total_pages || doc.numPages);
       setCurrentPage(1);
       setIndexStartPage(String(pdf.selected_start_page || 1));
-      setIndexEndPage(String(pdf.selected_end_page || Math.min(doc.numPages, 10)));
+      setIndexEndPage(String(pdf.selected_end_page || doc.numPages));
       setWorkflowStatus(pdf.status || "");
       setRetrievalStatus(pdf.retrieval_status || "");
       setPendingPages(pdf.pending_pages || 0);
       setChatReady(Boolean(pdf.chat_ready));
       setIndexedRange({
         start: pdf.selected_start_page || 1,
-        end: pdf.selected_end_page || Math.min(doc.numPages, 10),
+        end: pdf.selected_end_page || doc.numPages,
         count: pdf.indexed_pages || 0,
       });
       const normalized = normalizeSections(details?.index || [], nextCaseInfo.batchNo || "");
       setSections(normalized);
       rebuildCoverage(normalized, pdf.total_pages || doc.numPages);
+      setViewerTimingEvent({
+        recorded_at: new Date().toISOString(),
+        run_label: cached ? "viewer cache load" : "viewer load",
+        total_seconds: Number(((performance.now() - loadStartedAt) / 1000).toFixed(3)),
+        timings: {
+          saved_pdf_load_time: Number(((performance.now() - loadStartedAt) / 1000).toFixed(3)),
+        },
+      });
+      fetchPdfTimings(targetPdfId);
     } catch (err) {
       console.error(err);
-      setError("Error: " + err.message);
+      if (activeLoadRequestRef.current === requestId) {
+        setError(`Could not open the selected PDF smoothly. ${err.message}`);
+      }
     } finally {
-      setLoading(false);
-      setLoadingStep("");
+      if (!cached && activeLoadRequestRef.current === requestId) {
+        setLoading(false);
+        setLoadingStep("");
+      }
     }
-  }, [rebuildCoverage, storeCachedPdf, touchCachedPdf]);
+  }, [fetchPdfTimings, rebuildCoverage, storeCachedPdf, touchCachedPdf]);
 
   const spotlightIndexSection = useCallback(() => {
     if (indexSpotlightTimeoutRef.current) {
@@ -1217,7 +1474,7 @@ export default function App() {
       await loadSavedPdf(targetPdfId);
     }
     if (targetRecord && !targetRecord.index_ready) {
-      setError("Index is not ready yet for this PDF. It is still queued for Stage 1 indexing.");
+      setError("Index is not finalized yet for this PDF. It is still queued for full-document indexing or review.");
     }
     setTab("index");
     setShowQueueModal(false);
@@ -1227,12 +1484,17 @@ export default function App() {
   useEffect(() => {
     fetchSavedPdfs();
     fetchQueues();
+    fetchBatchReports();
     const timer = setInterval(() => {
       fetchSavedPdfs(pdfSearch);
-      fetchQueues();
+      if (apiSupportRef.current.queues) fetchQueues();
+      if (apiSupportRef.current.batchReports) fetchBatchReports();
+      if (selectedSavedPdfId) {
+        fetchPdfTimings(selectedSavedPdfId);
+      }
     }, 3000);
     return () => clearInterval(timer);
-  }, [fetchSavedPdfs, fetchQueues, pdfSearch]);
+  }, [fetchBatchReports, fetchPdfTimings, fetchSavedPdfs, fetchQueues, pdfSearch, selectedSavedPdfId]);
 
   useEffect(() => {
     const indexRunner = queueSnapshot.index_runner || {};
@@ -1253,7 +1515,7 @@ export default function App() {
           setChatReady(Boolean(pdf.chat_ready));
           setIndexedRange({
             start: pdf.selected_start_page || 1,
-            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            end: pdf.selected_end_page || (pdf.total_pages || totalPages || 1),
             count: pdf.indexed_pages || 0,
           });
         })
@@ -1283,7 +1545,7 @@ export default function App() {
           setChatReady(Boolean(pdf.chat_ready));
           setIndexedRange({
             start: pdf.selected_start_page || 1,
-            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            end: pdf.selected_end_page || (pdf.total_pages || totalPages || 1),
             count: pdf.indexed_pages || 0,
           });
         })
@@ -1303,7 +1565,7 @@ export default function App() {
       let firstQueuedPdfId = "";
       for (let idx = 0; idx < files.length; idx += BATCH_UPLOAD_CHUNK_SIZE) {
         const chunk = files.slice(idx, idx + BATCH_UPLOAD_CHUNK_SIZE);
-        setLoadingStep(`Queueing PDFs ${idx + 1}-${Math.min(files.length, idx + chunk.length)} of ${files.length} for overnight indexing...`);
+        setLoadingStep(`Queueing PDFs ${idx + 1}-${Math.min(files.length, idx + chunk.length)} of ${files.length} for batch indexing...`);
         const formData = new FormData();
         chunk.forEach((file) => formData.append("files", file));
         formData.append("start_page", "1");
@@ -1322,7 +1584,7 @@ export default function App() {
       }
     } catch (err) {
       console.error(err);
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1374,13 +1636,13 @@ export default function App() {
       setTotalPages(doc.numPages);
       setCurrentPage(1);
       setIndexStartPage("1");
-      setIndexEndPage(String(Math.min(doc.numPages, 10)));
+      setIndexEndPage(String(doc.numPages));
     } catch (err) {
       console.error(err);
       setPdfDoc(null);
       setPdfFile(null);
       setTotalPages(0);
-      setError("Error: " + getFetchErrorMessage(err));
+      setError(getFetchErrorMessage(err));
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1390,7 +1652,7 @@ export default function App() {
 
   const startIndexing = async () => {
     if (!pdfFile || !pdfDoc) {
-      setError("Error: Upload a PDF before starting indexing.");
+      setError("Upload a PDF before starting indexing.");
       return;
     }
 
@@ -1405,53 +1667,54 @@ export default function App() {
       await apiFetch("/health");
 
       let resp;
+      let activePdfId = pdfId;
       if (isRealFile(pdfFile)) {
-        setLoadingStep(`Starting background indexing for pages ${start} to ${end}...`);
+        setLoadingStep(`Uploading and extracting pages for ${totalPages} pages...`);
         const formData = new FormData();
         formData.append("file", pdfFile);
         formData.append("start_page", String(start));
         formData.append("end_page", String(end));
-        resp = await apiUpload("/api/index-runner/upload", formData);
-        if (!resp.started) {
-          if (resp.skipped_duplicate && resp.existing?.pdf_id) {
-            setPdfId(resp.existing.pdf_id);
-            await loadSavedPdf(resp.existing.pdf_id);
-            await fetchSavedPdfs(pdfSearch);
-            await fetchQueues();
-            return;
-          }
-          throw new Error(resp.message || "Background indexing is already running.");
-        }
-        setPdfId(resp.pdf_id);
-        handledIndexRunnerRef.current = "";
+        resp = await apiUpload("/api/ingest", formData);
+        activePdfId = resp.pdf_id;
+        setPdfId(activePdfId);
       } else if (pdfId) {
-        setLoadingStep(`Starting background re-indexing for pages ${start} to ${end}...`);
-        const formData = new FormData();
-        formData.append("start_page", String(start));
-        formData.append("end_page", String(end));
-        resp = await apiUpload(`/api/index-runner/saved/${pdfId}`, formData);
-        if (!resp.started) {
-          throw new Error(resp.message || "Background indexing is already running.");
-        }
-        handledIndexRunnerRef.current = "";
+        activePdfId = pdfId;
       } else {
         throw new Error("No upload source found for this PDF.");
       }
 
-      setWorkflowStatus("indexing_running");
-      setChatReady(false);
+      if (!activePdfId) {
+        throw new Error("Backend did not return a PDF ID.");
+      }
+
+      setLoadingStep("Building document index...");
+      const indexResp = await apiFetch("/api/generate-index", {
+        method: "POST",
+        body: JSON.stringify({ pdf_id: activePdfId }),
+      });
+      const normalized = normalizeSections(indexResp.index || [], caseInfo?.batchNo || "");
+      setSections(normalized);
+      rebuildCoverage(normalized, totalPages);
+      setIndexedRange({
+        start: indexResp.indexed_page_start,
+        end: indexResp.indexed_page_end,
+        count: indexResp.indexed_pages,
+      });
+      setWorkflowStatus(indexResp.status || resp?.status || "index_ready");
+      setRetrievalStatus(indexResp.retrieval_status || resp?.retrieval_status || "");
+      setPendingPages(indexResp.pending_pages ?? resp?.pending_pages ?? 0);
+      setChatReady(Boolean(indexResp.chat_ready ?? resp?.chat_ready));
       setBatchFilter((value) => value || caseInfo?.batchNo || "");
       await fetchSavedPdfs(pdfSearch);
-      await fetchQueues();
+      fetchQueues().catch(() => {});
     } catch (err) {
       console.error(err);
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
     }
   };
-
   const regenIndex = async () => {
     if (!pdfId) return;
     setLoading(true);
@@ -1475,7 +1738,7 @@ export default function App() {
       setChatReady(Boolean(resp.chat_ready ?? chatReady));
       fetchSavedPdfs(pdfSearch);
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1486,7 +1749,7 @@ export default function App() {
     if (!pdfId) return;
     setError("");
     setLoading(true);
-    setLoadingStep(`Deferred ingestion - processing ${pendingPages} pending pages...`);
+    setLoadingStep(`Legacy deferred ingestion - processing ${pendingPages} pending pages...`);
     try {
       const resp = await apiFetch(`/api/process-pending/${pdfId}`, { method: "POST" });
       setWorkflowStatus(resp.status || "vectorized");
@@ -1495,7 +1758,7 @@ export default function App() {
       setChatReady(Boolean(resp.chat_ready));
       fetchSavedPdfs(pdfSearch);
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1513,9 +1776,9 @@ export default function App() {
       })());
       setRetrievalStatus("queued_for_full_ingestion");
       fetchSavedPdfs(pdfSearch);
-      fetchQueues();
+      if (apiSupportRef.current.queues) fetchQueues();
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     }
   };
 
@@ -1531,7 +1794,7 @@ export default function App() {
       await fetchQueues();
       setError(resp.reset_count > 0 ? "" : `No PDFs needed a reset in the ${queueName} queue.`);
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1543,7 +1806,7 @@ export default function App() {
     const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
     const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
     if (isDeferredBusy || isIndexBusy) {
-      setError("Error: This PDF is currently being processed. Stop or wait for the running job before deleting it.");
+      setError("This PDF is currently being processed. Stop or wait for the running job before deleting it.");
       return;
     }
 
@@ -1578,7 +1841,7 @@ export default function App() {
       await fetchSavedPdfs(pdfSearch);
       await fetchQueues();
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1598,7 +1861,7 @@ export default function App() {
         setError(resp.message);
       }
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1619,7 +1882,7 @@ export default function App() {
         setError(resp.message);
       }
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1641,7 +1904,26 @@ export default function App() {
       await fetchSavedPdfs(pdfSearch);
       if (!resp.started && resp.message) setError(resp.message);
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+      setLoadingStep("");
+    }
+  };
+
+  const stopAllProcessing = async () => {
+    setError("");
+    setLoading(true);
+    setLoadingStep("Requesting all background runners to stop safely...");
+    try {
+      const formData = new FormData();
+      formData.append("action", "stop");
+      const resp = await apiUpload("/api/runners/control-all", formData);
+      await fetchQueues();
+      await fetchSavedPdfs(pdfSearch);
+      if (resp.message && !resp.accepted) setError(resp.message);
+    } catch (err) {
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1658,7 +1940,7 @@ export default function App() {
       await fetchSavedPdfs(pdfSearch);
       if (!resp.started && resp.message) setError(resp.message);
     } catch (err) {
-      setError("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1697,6 +1979,10 @@ export default function App() {
     index_ready: workflowStatus === "index_ready",
   } : null);
   const activeTone = getSavedPdfTone(selectedSavedPdf || {});
+  const currentStepLabel = getCurrentStepLabel(selectedSavedPdf || {});
+  const anyRunnerStopping = runnerStopping || indexRunner.status === "stopping" || stage1BatchRunner.status === "stopping" || auditRunner.status === "stopping" || reindexRunner.status === "stopping";
+  const anyRunnerPaused = runner.paused;
+  const systemStatusLabel = runnerLooksStuck ? "stuck" : anyRunnerStopping ? "stopping" : anyRunnerPaused ? "paused" : (runner.running || indexRunner.running || stage1BatchRunner.running || auditRunner.running || reindexRunner.running) ? "running" : "idle";
   const indexedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "indexed" || getSavedPdfTone(item) === "staged").length;
   const vectorizedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "ready").length;
   const reviewPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "review").length;
@@ -1748,9 +2034,9 @@ export default function App() {
             Batch Upload
             <input type="file" accept=".pdf" multiple style={{ display: "none" }} onChange={handleBatchUpload} />
           </label>
-          {pdfFile && <span className="nav-filename">{pdfFile.name} · {totalPages}p</span>}
+          {pdfFile && <span className="nav-filename">{pdfFile.name} - {totalPages}p</span>}
           {sections.length > 0 && (
-            <span className="coverage-pill">OK {covered}/{totalPages} pages · {sections.length} entries</span>
+            <span className="coverage-pill">OK {covered}/{totalPages} pages - {sections.length} entries</span>
           )}
         </div>
       </nav>
@@ -1774,7 +2060,7 @@ export default function App() {
                 </div>
                 <div className="library-head-actions">
                   <button className="queue-launch-btn" onClick={() => setShowQueueModal(true)}>
-                    Queue And Live Status
+                    Operations Panel
                     {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused || indexRunner.running || stage1BatchRunner.running) && <span className="queue-launch-dot" />}
                   </button>
                   <div className="section-count">{savedPdfs.length} saved PDFs</div>
@@ -1783,20 +2069,23 @@ export default function App() {
               <div className="library-summary-strip">
                 <span className="queue-pill">Indexed: {indexedPdfCount}</span>
                 <span className="queue-pill success">Vectorized: {vectorizedPdfCount}</span>
-                <span className="queue-pill">Stage 1 Batch: {(queueSnapshot.stage1_batch || []).length}</span>
+                <span className="queue-pill">Batch Queue: {(queueSnapshot.stage1_batch || []).length}</span>
                 <span className="queue-pill">Pending Queue: {(queueSnapshot.pending_vectorization || []).length}</span>
                 <span className="queue-pill warning">Review Queue: {reviewPdfCount}</span>
               </div>
               <div className="library-help subtle">
-                Soft color backgrounds help you spot what is indexed, what still needs vectorization, and what has been flagged for index repair.
+                Open any saved PDF directly. Queue numbers, review reasons, and current step labels help new operators understand what is happening without opening backend logs.
               </div>
               <div className="saved-pdf-list">
-                {savedPdfs.map((item) => {
+                {savedPdfs.map((item, itemIndex) => {
                   const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
                   const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
                   const isStage1BatchBusy = queueSnapshot.stage1_batch_runner?.running && queueSnapshot.stage1_batch_runner?.current_pdf_id === item.pdf_id;
                   const deleteDisabled = loading || isDeferredBusy || isIndexBusy || isStage1BatchBusy;
+                  const indexViewDisabled = isIndexBusy && !item.index_ready;
                   const cardTone = getSavedPdfTone(item);
+                  const batchQueuePosition = (queueSnapshot.stage1_batch || []).findIndex((queued) => queued.pdf_id === item.pdf_id);
+                  const reviewQueuePosition = (queueSnapshot.reindex_review || []).findIndex((queued) => queued.pdf_id === item.pdf_id);
                   return (
                     <div
                       key={item.pdf_id}
@@ -1804,7 +2093,7 @@ export default function App() {
                     >
                       <div className="saved-pdf-row">
                         <div className="saved-pdf-heading">
-                          <div className="saved-pdf-title">{item.cnr_number || item.filename}</div>
+                          <div className="saved-pdf-title">#{itemIndex + 1} - {item.cnr_number || item.filename}</div>
                           <span className={`saved-pdf-tone-pill tone-pill-${cardTone}`}>{getSavedPdfToneLabel(cardTone)}</span>
                         </div>
                         <button
@@ -1817,11 +2106,14 @@ export default function App() {
                           Delete
                         </button>
                       </div>
-                      <div className="saved-pdf-meta">{item.filename} ? {item.total_pages || 0} pages</div>
+                      <div className="saved-pdf-meta">{item.filename} - {item.total_pages || 0} pages</div>
                       <div className="saved-pdf-tags">
                         <span>status: {formatSavedPdfStatus(item)}</span>
                         <span>retrieval: {item.retrieval_status}</span>
                         <span>pending: {item.pending_pages || 0}</span>
+                        {batchQueuePosition >= 0 ? <span>batch queue no.: #{batchQueuePosition + 1} from top</span> : null}
+                        {reviewQueuePosition >= 0 ? <span>review queue no.: #{reviewQueuePosition + 1} from top</span> : null}
+                        {item.review_reason ? <span>review reason: {item.review_reason}</span> : null}
                       </div>
                       <div className="saved-pdf-note">
                         {describeSavedPdfStatus(item, { isDeferredBusy, isIndexBusy, isStage1BatchBusy })}
@@ -1830,7 +2122,7 @@ export default function App() {
                         <button className="saved-pdf-open" onClick={() => loadSavedPdf(item.pdf_id)}>
                           Open PDF
                         </button>
-                        <button className="saved-pdf-index" onClick={() => jumpToIndexView(item.pdf_id)}>
+                        <button className="saved-pdf-index" onClick={() => jumpToIndexView(item.pdf_id)} disabled={indexViewDisabled} title={indexViewDisabled ? "Wait for the current indexing run to finish for this PDF" : "Open index view"}>
                           Index View
                         </button>
                       </div>
@@ -1853,17 +2145,31 @@ export default function App() {
           )}
 
           {pdfDoc && (
+            <div className={`system-status-strip system-${systemStatusLabel}`}>
+              <span className="system-status-label">System Status</span>
+              <span className="system-status-pill">{systemStatusLabel}</span>
+              <span className="system-status-meta">Current step: {currentStepLabel}</span>
+              {selectedSavedPdf?.review_reason ? <span className="system-status-meta">Review reason: {selectedSavedPdf.review_reason}</span> : null}
+            </div>
+          )}
+
+          {pdfDoc && (
             <div ref={indexSectionRef} className={`indexing-toolbar tone-panel-${activeTone} ${indexSpotlight ? "index-spotlight" : ""}`}>
               <div className="indexing-copy">
                 <div className="indexing-title">Indexing Controls</div>
                 <div className="indexing-hint">
-                  Upload loads the preview first. Stage 1 then scans pages 1-10 by default, builds and saves the index immediately, and leaves the remaining pages for deferred ingestion unless you process them now.
+                  Upload loads the preview first. The backend then extracts and vectorizes the full PDF before building the final index from whole-document evidence and routing weak results to review.
                 </div>
+              </div>
+              <div className="current-step-banner">
+                <span className="current-step-label">Current Step</span>
+                <span className="current-step-value">{currentStepLabel}</span>
+                {selectedSavedPdf?.review_reason ? <span className="current-step-note">{selectedSavedPdf.review_reason}</span> : null}
               </div>
               <div className="workflow-help">
                 <span>1. Upload or fetch a PDF.</span>
-                <span>2. Click Start Indexing to save Stage 1 in the backend.</span>
-                <span>3. Use Process Pending now for small PDFs, or Save To Queue for later full vectorization.</span>
+                <span>2. Click Start Indexing to run full-document OCR, vectorization, and final indexing in the backend.</span>
+                <span>3. Weak indexes go to review automatically instead of being finalized silently.</span>
               </div>
               <div className="indexing-form">
                 <div className="range-group">
@@ -1924,6 +2230,9 @@ export default function App() {
             <div className={`tab-bar tone-panel-${activeTone}`}>
               <button className={`tab-btn ${tab === "index" ? "active" : ""}`} onClick={() => setTab("index")}>
                 Index Table
+              </button>
+              <button className={`tab-btn ${tab === "review" ? "active" : ""}`} onClick={() => setTab("review")}>
+                Review Queue
               </button>
               <button
                 className={`tab-btn ${tab === "chat" ? "active" : ""}`}
@@ -1992,8 +2301,8 @@ export default function App() {
                               </div>
                             </td>
                             <td className="col-batch"><span className="batch-pill">{sec.batchNo || "-"}</span></td>
-                            <td className="col-page">{formatPageValue(sec.tocPageFrom, sec.tocPageFrom || sec.tocPageTo, sec.pdfPageFrom || sec.pageFrom, sec.pdfPageFrom || sec.pageFrom, "TOC", "PDF")}</td>
-                            <td className="col-page">{formatPageValue(sec.tocPageTo, sec.tocPageTo || sec.tocPageFrom, sec.pdfPageTo || sec.pageTo, sec.pdfPageTo || sec.pageTo, "TOC", "PDF")}</td>
+                            <td className="col-page">{sec.pageFrom || sec.pdfPageFrom || "-"}</td>
+                            <td className="col-page">{sec.pageTo || sec.pdfPageTo || "-"}</td>
                             <td className="col-action">
                               <button className="action-btn edit-btn" onClick={(e) => { e.stopPropagation(); setEditingIdx(editingIdx === idx ? null : idx); }}>Edit</button>
                             </td>
@@ -2025,7 +2334,7 @@ export default function App() {
                     <div style={{ textAlign: "center", padding: 60, color: "#9ca3af" }}>
                       <div style={{ fontSize: 48, marginBottom: 12 }}>IDX</div>
                       <div style={{ fontWeight: 500, marginBottom: 6 }}>Preview loaded</div>
-                      <div style={{ fontSize: 13 }}>Stage 1 will scan pages 1-10 by default unless you choose another range</div>
+                      <div style={{ fontSize: 13 }}>Full-document indexing now scans every page before finalizing the index</div>
                     </div>
                   ) : (
                     <div style={{ textAlign: "center", padding: 60, color: "#9ca3af" }}>
@@ -2036,6 +2345,40 @@ export default function App() {
                   )}
                 </div>
               )}
+            </div>
+          )}
+
+          {tab === "review" && (
+            <div className="content-panel review-content-panel">
+              <div className="review-queue-panel">
+                <div className="review-queue-head">
+                  <div>
+                    <div className="section-title">Review Queue</div>
+                    <div className="section-subtitle">Top of queue is shown first with case number, filename, queue number, and review reason.</div>
+                  </div>
+                  <span className="queue-pill warning">{(queueSnapshot.reindex_review || []).length} waiting</span>
+                </div>
+                {(queueSnapshot.reindex_review || []).length ? (
+                  <div className="review-queue-list">
+                    {(queueSnapshot.reindex_review || []).map((item, idx) => (
+                      <button key={`review-tab-${item.pdf_id}`} className="review-queue-row" onClick={() => loadSavedPdf(item.pdf_id)}>
+                        <span className="review-queue-number">#{idx + 1}</span>
+                        <span className="review-queue-case"><strong>Case:</strong> {item.cnr_number || item.pdf_id}</span>
+                        <span className="review-queue-file"><strong>File:</strong> {item.filename || item.pdf_id}</span>
+                        <span className="review-queue-reason"><strong>Reason:</strong> {item.review_reason || "Needs manual review"}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="table-empty">
+                    <div style={{ textAlign: "center", padding: 50, color: "#9ca3af" }}>
+                      <div style={{ fontSize: 48, marginBottom: 12 }}>REVIEW</div>
+                      <div style={{ fontWeight: 500, marginBottom: 6 }}>No PDFs are waiting for review</div>
+                      <div style={{ fontSize: 13 }}>Suspicious indexes will appear here automatically.</div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2143,6 +2486,12 @@ export default function App() {
         forceResetQueue={forceResetQueue}
         startIndexAudit={startIndexAudit}
         runReviewReindexQueue={runReviewReindexQueue}
+        stopAllProcessing={stopAllProcessing}
+        timingEvents={timingEvents}
+        viewerTimingEvent={viewerTimingEvent}
+        showTimingPanel={showTimingPanel}
+        setShowTimingPanel={setShowTimingPanel}
+        selectedPdfLabel={selectedSavedPdf?.filename || selectedSavedPdf?.cnr_number || selectedSavedPdf?.pdf_id || ""}
         auditRowStart={auditRowStart}
         auditRowEnd={auditRowEnd}
         setAuditRowStart={setAuditRowStart}
@@ -2153,4 +2502,3 @@ export default function App() {
     </div>
   );
 }
-
